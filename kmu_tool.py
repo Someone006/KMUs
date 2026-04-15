@@ -94,8 +94,8 @@ ZEFIX_DEFAULT_LIMIT = 10000
 ZEFIX_MAX_ATTEMPTS_PER_PAGE = 12
 ZEFIX_POST_TIMEOUT_SEC = 45
 ZEFIX_POST_RETRIES = 2
-DEFAULT_WORKERS = 1000
-MAX_INTERNAL_WORKERS = 1000
+DEFAULT_WORKERS = 120
+MAX_INTERNAL_WORKERS = 200
 KMU_MIN_EMPLOYEES = 10
 KMU_MAX_EMPLOYEES: int | None = None
 BFS_SNAPSHOT_URL = "https://www.agvchapp.bfs.admin.ch/api/communes/snapshot?date={date}"
@@ -112,7 +112,7 @@ LOCALCH_SEED_URL = "https://www.local.ch/en/q?what={term}&where={where}"
 MONEYHOUSE_SEARCH_URL = "https://www.moneyhouse.ch/de/search?q={query}"
 SWISSGUIDE_SEARCH_URL = "https://www.swissguide.ch/suche?query={query}"
 SEED_PAGES_MAX = 4
-VISITED_PAGES_FILE = "visited_seed_pages.json"
+VISITED_PAGES_FILE = str(Path(__file__).resolve().with_name("visited_seed_pages.json"))
 SEARCH_DISCOVERY_DISABLED = False
 SEARCH_BLOCKLIST = (
     "duckduckgo.com",
@@ -433,9 +433,9 @@ def clone_company(company: Company) -> Company:
 
 def resolve_worker_count(requested_workers: int | None, default_workers: int = DEFAULT_WORKERS) -> int:
     if requested_workers is not None and requested_workers > 0:
-        return requested_workers
+        return max(1, min(requested_workers, MAX_INTERNAL_WORKERS))
     cpu_count = os.cpu_count() or 4
-    return max(2, min(default_workers, cpu_count * 2))
+    return max(2, min(default_workers, cpu_count * 2, MAX_INTERNAL_WORKERS))
 
 
 def job_update(**updates: object) -> None:
@@ -3077,7 +3077,7 @@ def html_page(
                 </div>
                 <div class="field">
                     <label for="workers">Parallele Worker</label>
-                    <input id="workers" type="number" min="1" value="1000" />
+                    <input id="workers" type="number" min="1" value="120" />
                 </div>
                 <div class="field">
                     <label for="timeout">Timeout pro Request (Sek.)</label>
@@ -3205,7 +3205,7 @@ def html_page(
         payload.set('email_scan', controls.emailScan.value || '800');
       }}
       
-            payload.set('workers', controls.workers.value || '1000');
+            payload.set('workers', controls.workers.value || '120');
       payload.set('timeout', controls.timeout.value || '10');
       payload.set('discover', controls.discover.value || '1');
             const selectedSeedSources = controls.seedSources.filter((item) => item.checked).map((item) => item.value);
@@ -3613,6 +3613,7 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         print(f"Starte E-Mail-Anreicherung für {len(pending)} Firmen mit {workers} parallelen Prozessen...")
 
         processed_since_persist = 0
+        persist_every = 25
 
         def handle_result(working: Company, stats: dict[str, int]) -> None:
             nonlocal processed_since_persist
@@ -3631,7 +3632,7 @@ def command_bootstrap(args: argparse.Namespace) -> int:
                 print(f"  Gefunden: {company_summary(working)}")
             else:
                 job_increment(skipped=1)
-            if processed_since_persist >= 1:
+            if processed_since_persist >= persist_every:
                 persist()
                 processed_since_persist = 0
             print(f"  Fortschritt: {make_job_summary()}")
