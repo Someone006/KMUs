@@ -1,0 +1,16 @@
+companies.json
+companies-zefix-test.json
+companies_test*.json
+companies_quick_test.json
+companies_multi_1.json
+test.csv
+test.xlsx
+.cache/
+__pycache__/
+*.pyc
+.kmu-worker.pid
+kmu-worker.log
+visited_seed_pages.json
+*.log
+*.pid
+tmp-*.json

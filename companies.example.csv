@@ -1,0 +1,3 @@
+name,legal_form,employees,city,canton,website,source,uid
+Muster AG,AG,1-10,Zürich,ZH,https://example.com,Open Data,CH123456789
+Beispiel GmbH,GmbH,11-50,Bern,BE,https://example.org,Open Data,CH987654321

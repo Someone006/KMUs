@@ -1,0 +1,24 @@
+[Unit]
+Description=KMU 24x7 Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kmus
+Environment=DATA_FILE=companies.json
+Environment=LIMIT=10000
+Environment=EMAIL_SCAN=1200
+Environment=TIMEOUT=12
+Environment=SLEEP_SECONDS=120
+Environment=SEED_SOURCES=zefix,search.ch,tel.search.ch,local.ch,local.ch.ch,moneyhouse,swissguide
+Environment=DISCOVER_WEBSITES=1
+Environment=PYTHON_BIN=/opt/kmus/.venv/bin/python
+ExecStart=/opt/kmus/worker_loop.sh
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
