@@ -1986,7 +1986,24 @@ def parse_employee_filter(value: str | None) -> tuple[int | None, int | None]:
 def company_key(company: Company) -> str:
     if company.uid:
         return f"uid:{company.uid}"
-    return f"name:{normalize_text(company.name)}|city:{normalize_text(company.city)}|legal:{normalize_text(company.legal_form)}"
+    # Verbesserte Deduplizierung: Website/Email-Domain als zusätzlicher Identifier
+    # Dadurch werden Firmen "Immobilia AG" und "Immobilie ABB" nicht vermischt
+    website_domain = ""
+    if company.website:
+        parsed = urlparse(company.website)
+        website_domain = parsed.netloc.lower()
+    elif company.emails:
+        # Notfalls Email-Domain als Hint verwenden
+        website_domain = company.emails[0].rsplit("@", 1)[-1].lower() if "@" in company.emails[0] else ""
+    
+    key_parts = [
+        f"name:{normalize_text(company.name)}",
+        f"city:{normalize_text(company.city)}",
+        f"legal:{normalize_text(company.legal_form)}"
+    ]
+    if website_domain:
+        key_parts.append(f"domain:{website_domain}")
+    return "|".join(key_parts)
 
 
 def company_summary(company: Company) -> str:
@@ -2935,6 +2952,7 @@ def html_page(
     }
     button[data-action="enrich"] { background: linear-gradient(135deg, #f2552c, #d43c16); }
     button[data-action="seed"] { background: linear-gradient(135deg, #2a7de1, #1f63b8); }
+    button[data-action="unlimited"] { background: linear-gradient(135deg, #9333ea, #7e22ce); }
     button[data-action="stop"] { background: linear-gradient(135deg, #7f1d1d, #ef4444); }
     .hint { margin-top: 10px; color: var(--muted); font-size: 0.92rem; }
         .stats {
@@ -3063,9 +3081,10 @@ def html_page(
         <button data-action="bootstrap">Seed + Email-Scan starten</button>
         <button data-action="seed">Nur Seed starten</button>
         <button data-action="enrich">Nur Email-Scan starten</button>
+                <button data-action="unlimited">Unbegrenzte Suche starten</button>
                 <button data-action="stop">Job stoppen</button>
       </div>
-      <div class="hint">Die Jobs laufen im Hintergrund. Waehle danach Filter oder exportiere direkt.</div>
+      <div class="hint">Die Jobs laufen im Hintergrund. "Unbegrenzte Suche" läuft bis zum Stop-Button - perfekt für 24/7 Betrieb.</div>
     </section>
 
     <section class="panel">
@@ -3158,20 +3177,28 @@ def html_page(
                 return;
             }}
       const payload = new URLSearchParams();
-      payload.set('limit', controls.limit.value || '10000');
-      payload.set('email_scan', controls.emailScan.value || '800');
+      
+      // Für unbegrenzte Suche: setze limit auf sehr hohe Zahl
+      if (action === 'unlimited') {{
+        payload.set('limit', '999999999');
+        payload.set('email_scan', controls.emailScan.value || '800');
+      }} else {{
+        payload.set('limit', controls.limit.value || '10000');
+        payload.set('email_scan', controls.emailScan.value || '800');
+      }}
+      
             payload.set('workers', controls.workers.value || '1000');
       payload.set('timeout', controls.timeout.value || '10');
       payload.set('discover', controls.discover.value || '1');
             const selectedSeedSources = controls.seedSources.filter((item) => item.checked).map((item) => item.value);
-            if ((action === 'seed' || action === 'bootstrap') && selectedSeedSources.length === 0) {{
+            if ((action === 'seed' || action === 'bootstrap' || action === 'unlimited') && selectedSeedSources.length === 0) {{
                 alert('Bitte mindestens eine Seed-Quelle auswaehlen.');
                 return;
             }}
             payload.set('seed_sources', selectedSeedSources.join(','));
-            statusEl.textContent = 'Status: starte...';
+            statusEl.textContent = 'Status: starte unbegrenzte Suche...';
             setBusy(true);
-      const response = await fetch('/api/run/' + action, {{
+      const response = await fetch('/api/run/' + (action === 'unlimited' ? 'bootstrap' : action), {{
         method: 'POST',
         headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
         body: payload.toString()
