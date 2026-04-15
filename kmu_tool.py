@@ -397,6 +397,25 @@ def company_to_export_row(company: Company) -> dict[str, str]:
     return row
 
 
+def company_to_export_rows(company: Company) -> list[dict[str, str]]:
+    """
+    Erzeugt Export-Zeilen mit genau einer E-Mail pro Zeile.
+    Eine Firma mit mehreren E-Mails erscheint mehrfach.
+    """
+    base = company_to_row(company)
+    emails = sorted({normalize_text(email).lower() for email in company.emails if normalize_text(email)})
+    if not emails:
+        row = dict(base)
+        row["emails"] = ""
+        return [row]
+    rows: list[dict[str, str]] = []
+    for email in emails:
+        row = dict(base)
+        row["emails"] = email
+        rows.append(row)
+    return rows
+
+
 def clone_company(company: Company) -> Company:
     return Company(
         name=company.name,
@@ -1680,8 +1699,9 @@ def validate_company_emails(
     if is_blocked_foreign_domain(host):
         return []
     allowed_domain = root_domain(host)
-    website_tld = host_tld(host)
     strong_content_match = page_mentions_company_and_city(company, page_text)
+    directory_mode = any(host.endswith(blocked) or host == blocked for blocked in SEARCH_BLOCKLIST)
+    name_tokens = {token for token in company_name_tokens(company.name) if len(token) >= 4}
     valid: set[str] = set()
     for email in emails:
         candidate = normalize_text(email).lower()
@@ -1695,16 +1715,30 @@ def validate_company_emails(
         if is_blocked_foreign_domain(domain):
             continue
         domain_matches_website = allowed_domain and (domain == allowed_domain or domain.endswith("." + allowed_domain))
-        if not domain_matches_website:
+        if domain_matches_website:
+            valid.add(candidate)
+            continue
+
+        if directory_mode:
+            # Bei Verzeichnis-Seiten (z.B. local.ch/search.ch) nur sehr strenge Zuordnung:
+            # .ch Domain, Firmenname auf Seite bestaetigt und Domain enthaelt Firmen-Token.
             if domain in FREE_EMAIL_DOMAINS:
-                continue
-            if website_tld != "ch":
                 continue
             if host_tld(domain) != "ch":
                 continue
             if not strong_content_match:
                 continue
-        valid.add(candidate)
+            domain_blob = re.sub(r"[^a-z0-9]+", "", root_domain(domain))
+            if not any(token in domain_blob for token in name_tokens):
+                continue
+            valid.add(candidate)
+            continue
+
+        if not domain_matches_website:
+            if domain in FREE_EMAIL_DOMAINS:
+                continue
+            # Fuer normale Firmen-Websites keine Cross-Domain-Akzeptanz.
+            continue
     return sorted(valid)
 
 
@@ -2670,20 +2704,27 @@ def html_escape_attr(value: str) -> str:
 
 def render_export_rows(companies: list[Company]) -> list[list[str]]:
     rows = []
+    seen_emails: set[str] = set()
     for company in companies:
-        rows.append(
-            [
-                company.name,
-                company.legal_form,
-                company.employee_label,
-                company.city,
-                company.canton,
-                company.website,
-                ", ".join(company.emails),
-                company.source,
-                company.uid,
-            ]
-        )
+        for export_row in company_to_export_rows(company):
+            email_value = export_row["emails"].strip().lower()
+            if email_value and email_value in seen_emails:
+                continue
+            if email_value:
+                seen_emails.add(email_value)
+            rows.append(
+                [
+                    export_row["name"],
+                    export_row["legal_form"],
+                    export_row["employee_label"],
+                    export_row["city"],
+                    export_row["canton"],
+                    export_row["website"],
+                    export_row["emails"],
+                    export_row["source"],
+                    export_row["uid"],
+                ]
+            )
     return rows
 
 
@@ -2692,18 +2733,8 @@ def export_csv_text(companies: list[Company]) -> str:
     buffer = tempfile.SpooledTemporaryFile(mode="w+", encoding="utf-8", newline="")
     writer = csv.writer(buffer)
     writer.writerow(headers)
-    for company in companies:
-        writer.writerow([
-            company.name,
-            company.legal_form,
-            company.employee_label,
-            company.city,
-            company.canton,
-            company.website,
-            ", ".join(company.emails),
-            company.source,
-            company.uid,
-        ])
+    for row in render_export_rows(companies):
+        writer.writerow(row)
     buffer.seek(0)
     return buffer.read()
 
@@ -2724,20 +2755,7 @@ def column_name(index: int) -> str:
 
 def build_xlsx_bytes(companies: list[Company]) -> bytes:
     headers = ["name", "legal_form", "employees", "city", "canton", "website", "emails", "source", "uid"]
-    rows = [headers] + [
-        [
-            company.name,
-            company.legal_form,
-            company.employee_label,
-            company.city,
-            company.canton,
-            company.website,
-            ", ".join(company.emails),
-            company.source,
-            company.uid,
-        ]
-        for company in companies
-    ]
+    rows = [headers] + render_export_rows(companies)
 
     sheet_rows = []
     for row_index, row in enumerate(rows, start=1):
