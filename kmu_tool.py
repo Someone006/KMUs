@@ -94,8 +94,8 @@ ZEFIX_DEFAULT_LIMIT = 10000
 ZEFIX_MAX_ATTEMPTS_PER_PAGE = 12
 ZEFIX_POST_TIMEOUT_SEC = 45
 ZEFIX_POST_RETRIES = 2
-DEFAULT_WORKERS = 120
-MAX_INTERNAL_WORKERS = 200
+DEFAULT_WORKERS = 1000
+MAX_INTERNAL_WORKERS = 1000
 KMU_MIN_EMPLOYEES = 10
 KMU_MAX_EMPLOYEES: int | None = None
 BFS_SNAPSHOT_URL = "https://www.agvchapp.bfs.admin.ch/api/communes/snapshot?date={date}"
@@ -3077,7 +3077,7 @@ def html_page(
                 </div>
                 <div class="field">
                     <label for="workers">Parallele Worker</label>
-                    <input id="workers" type="number" min="1" value="120" />
+                    <input id="workers" type="number" min="1" value="1000" />
                 </div>
                 <div class="field">
                     <label for="timeout">Timeout pro Request (Sek.)</label>
@@ -3098,7 +3098,7 @@ def html_page(
       <div class="btn-row">
         <button data-action="bootstrap">Seed + Email-Scan starten</button>
         <button data-action="seed">Nur Seed starten</button>
-        <button data-action="enrich">Nur Email-Scan starten</button>
+        <button data-action="enrich">Seed stoppen + E-Mail-Scan starten</button>
                 <button data-action="unlimited">Unbegrenzte Suche starten</button>
                 <button data-action="stop">Job stoppen</button>
       </div>
@@ -3197,15 +3197,15 @@ def html_page(
       const payload = new URLSearchParams();
       
       // Für unbegrenzte Suche: setze limit auf sehr hohe Zahl
-      if (action === 'unlimited') {{
-        payload.set('limit', '999999999');
-        payload.set('email_scan', controls.emailScan.value || '800');
+            if (action === 'unlimited') {{
+                payload.set('limit', '1000000000');
+                payload.set('email_scan', '1000000000');
       }} else {{
         payload.set('limit', controls.limit.value || '10000');
         payload.set('email_scan', controls.emailScan.value || '800');
       }}
       
-            payload.set('workers', controls.workers.value || '120');
+                        payload.set('workers', controls.workers.value || '1000');
       payload.set('timeout', controls.timeout.value || '10');
       payload.set('discover', controls.discover.value || '1');
             const selectedSeedSources = controls.seedSources.filter((item) => item.checked).map((item) => item.value);
@@ -3581,20 +3581,24 @@ def command_bootstrap(args: argparse.Namespace) -> int:
     )
     print(f"Seed geladen: {len(companies)} Firmen")
 
-    stored_companies = {company_key(company): company for company in load_companies(destination) if company_is_storable(company)}
+    stored_companies = {company_key(company): company for company in load_companies(destination)}
+    for company in companies:
+        key = company_key(company)
+        existing = stored_companies.get(key)
+        stored_companies[key] = merge_companies(existing, company) if existing is not None else company
+    # Seeds sofort sichern, damit ein späterer E-Mail-Scan auf dem vorhandenen Bestand weiterarbeiten kann.
+    save_companies(destination, stored_companies.values())
     workers = resolve_worker_count(getattr(args, "workers", None))
 
     def persist() -> None:
         save_companies(destination, stored_companies.values())
 
-    if stored_companies:
-        persist()
     if args.email_scan > 0:
         scan_count = min(args.email_scan, len(companies))
         pending: list[Company] = []
         for company in companies[:scan_count]:
             existing = stored_companies.get(company_key(company))
-            if existing and company_is_storable(existing):
+            if existing and existing.emails:
                 continue
             pending.append(merge_companies(existing, company))
 
@@ -3626,11 +3630,9 @@ def command_bootstrap(args: argparse.Namespace) -> int:
                 errors=int(stats.get("errors", 0)),
             )
             job_set_current(working.name)
-            if company_is_storable(working):
-                stored_companies[key] = working
-                job_increment(accepted=1)
-                print(f"  Gefunden: {company_summary(working)}")
-            else:
+            stored_companies[key] = merge_companies(stored_companies.get(key), working)
+            job_increment(accepted=1)
+            if not working.emails:
                 job_increment(skipped=1)
             if processed_since_persist >= persist_every:
                 persist()
@@ -3646,7 +3648,6 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         )
         persist()
 
-    stored_companies = {key: company for key, company in stored_companies.items() if company_is_storable(company)}
     persist()
     with_emails = sum(1 for company in stored_companies.values() if company.emails)
     with_websites = sum(1 for company in stored_companies.values() if company.website)
@@ -3675,6 +3676,7 @@ def command_search(args: argparse.Namespace) -> int:
 
 def command_enrich(args: argparse.Namespace) -> int:
     data_path = Path(args.data)
+    target = Path(args.out or data_path)
     companies = load_companies(data_path)
     workers = resolve_worker_count(getattr(args, "workers", None))
     target_count = min(args.limit, len(companies)) if args.limit is not None else len(companies)
@@ -3693,10 +3695,14 @@ def command_enrich(args: argparse.Namespace) -> int:
         last_message="Starte parallelen Email-Scan",
     )
 
-    results: list[Company] = []
+    stored_companies = {company_key(company): company for company in companies}
+
+    def persist() -> None:
+        save_companies(target, stored_companies.values())
 
     def handle_result(working: Company, stats: dict[str, int]) -> None:
-        results.append(working)
+        key = company_key(working)
+        stored_companies[key] = merge_companies(stored_companies.get(key), working)
         job_increment(
             processed=1,
             websites_found=int(stats.get("websites_found", 0)),
@@ -3704,10 +3710,10 @@ def command_enrich(args: argparse.Namespace) -> int:
             errors=int(stats.get("errors", 0)),
         )
         job_set_current(working.name)
-        if company_is_storable(working):
-            job_increment(accepted=1)
-        else:
+        job_increment(accepted=1)
+        if not working.emails:
             job_increment(skipped=1)
+        persist()
 
     process_companies_parallel(
         pending,
@@ -3716,10 +3722,8 @@ def command_enrich(args: argparse.Namespace) -> int:
         workers=workers,
         on_result=handle_result,
     )
-    target = Path(args.out or data_path)
-    filtered = [company for company in results if company_is_storable(company)]
-    save_companies(target, filtered)
-    print(f"Angereichert: {len(filtered)} Firmen -> {target}")
+    persist()
+    print(f"Angereichert: {len(stored_companies)} Firmen -> {target}")
     return 0
 
 

@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/kmus
 Environment=DATA_FILE=companies.json
-Environment=LIMIT=10000
-Environment=EMAIL_SCAN=1200
+Environment=LIMIT=1000000000
+Environment=EMAIL_SCAN=1000000000
 Environment=TIMEOUT=12
 Environment=SLEEP_SECONDS=120
 Environment=SEED_SOURCES=zefix,search.ch,tel.search.ch,local.ch,local.ch.ch,moneyhouse,swissguide
