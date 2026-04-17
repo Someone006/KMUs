@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -3352,9 +3353,32 @@ def start_background_job(job_type: str, task: Callable[[], None]) -> tuple[bool,
 
 class KMURequestHandler(BaseHTTPRequestHandler):
     dataset_path: Path = Path("companies.json")
+    _dataset_cache_lock = threading.Lock()
+    _dataset_cache_mtime_ns: int | None = None
+    _dataset_cache_path: Path | None = None
+    _dataset_cache_companies: list[Company] | None = None
 
     def _load(self) -> list[Company]:
-        return load_companies(self.dataset_path)
+        path = self.dataset_path
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return []
+
+        with self._dataset_cache_lock:
+            if (
+                self._dataset_cache_path == path
+                and self._dataset_cache_mtime_ns == mtime_ns
+                and self._dataset_cache_companies is not None
+            ):
+                return list(self._dataset_cache_companies)
+
+        companies = load_companies(path)
+        with self._dataset_cache_lock:
+            self._dataset_cache_path = path
+            self._dataset_cache_mtime_ns = mtime_ns
+            self._dataset_cache_companies = list(companies)
+        return companies
 
     def _send(self, content: str, status: int = 200, content_type: str = "text/html; charset=utf-8") -> None:
         payload = content.encode("utf-8")
@@ -3363,6 +3387,23 @@ class KMURequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_error_response(self, status: int, message: str) -> None:
+        body = json.dumps({"ok": False, "message": message}, ensure_ascii=False, indent=2)
+        self._send(body, status=status, content_type="application/json; charset=utf-8")
+
+    def _safe_handle(self, func: Callable[[], None]) -> None:
+        try:
+            func()
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            print("[web-error]", error_text, file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+            if not self.wfile.closed:
+                try:
+                    self._send_error_response(500, error_text)
+                except Exception:
+                    pass
 
     def _filtered_companies(self, params: dict[str, str]) -> list[Company]:
         return [company for company in self._load() if company_matches(company, params)]
@@ -3389,126 +3430,132 @@ class KMURequestHandler(BaseHTTPRequestHandler):
         return raw in {"1", "true", "yes", "ja", "y", "on"}
 
     def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/search":
+        def handler() -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/search":
+                params = self._query_params(parsed.query)
+                companies = self._filtered_companies(params)
+                body = json.dumps(serialize_companies(companies), ensure_ascii=False, indent=2)
+                self._send(body, content_type="application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/job":
+                body = json.dumps(job_status_snapshot(), ensure_ascii=False, indent=2)
+                self._send(body, content_type="application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/stop":
+                ok = request_job_stop()
+                body = json.dumps({"ok": ok, "message": "Stop angefordert" if ok else "Kein laufender Job"}, ensure_ascii=False, indent=2)
+                status = 202 if ok else 409
+                self._send(body, status=status, content_type="application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/emails":
+                params = parse_qs(parsed.query)
+                website = (params.get("website") or [""])[0]
+                body = json.dumps({"website": website, "emails": crawl_public_emails(website)}, ensure_ascii=False, indent=2)
+                self._send(body, content_type="application/json; charset=utf-8")
+                return
+            if parsed.path in {"/export.csv", "/export.xlsx"}:
+                params = self._query_params(parsed.query)
+                companies = self._filtered_companies(params)
+                if parsed.path == "/export.csv":
+                    self._send(export_csv_text(companies), content_type="text/csv; charset=utf-8")
+                else:
+                    xlsx_bytes = build_xlsx_bytes(companies)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    self.send_header("Content-Length", str(len(xlsx_bytes)))
+                    self.send_header("Content-Disposition", 'attachment; filename="kmus.xlsx"')
+                    self.end_headers()
+                    self.wfile.write(xlsx_bytes)
+                return
             params = self._query_params(parsed.query)
             companies = self._filtered_companies(params)
-            body = json.dumps(serialize_companies(companies), ensure_ascii=False, indent=2)
-            self._send(body, content_type="application/json; charset=utf-8")
-            return
-        if parsed.path == "/api/job":
-            body = json.dumps(job_status_snapshot(), ensure_ascii=False, indent=2)
-            self._send(body, content_type="application/json; charset=utf-8")
-            return
-        if parsed.path == "/api/stop":
-            ok = request_job_stop()
-            body = json.dumps({"ok": ok, "message": "Stop angefordert" if ok else "Kein laufender Job"}, ensure_ascii=False, indent=2)
-            status = 202 if ok else 409
-            self._send(body, status=status, content_type="application/json; charset=utf-8")
-            return
-        if parsed.path == "/api/emails":
-            params = parse_qs(parsed.query)
-            website = (params.get("website") or [""])[0]
-            body = json.dumps({"website": website, "emails": crawl_public_emails(website)}, ensure_ascii=False, indent=2)
-            self._send(body, content_type="application/json; charset=utf-8")
-            return
-        if parsed.path in {"/export.csv", "/export.xlsx"}:
-            params = self._query_params(parsed.query)
-            companies = self._filtered_companies(params)
-            if parsed.path == "/export.csv":
-                self._send(export_csv_text(companies), content_type="text/csv; charset=utf-8")
-            else:
-                xlsx_bytes = build_xlsx_bytes(companies)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                self.send_header("Content-Length", str(len(xlsx_bytes)))
-                self.send_header("Content-Disposition", 'attachment; filename="kmus.xlsx"')
-                self.end_headers()
-                self.wfile.write(xlsx_bytes)
-            return
-        params = self._query_params(parsed.query)
-        companies = self._filtered_companies(params)
-        page = self._to_int(params, "page", 1, min_value=1)
-        page_size = min(self._to_int(params, "page_size", 200, min_value=1), 1000)
-        start = (page - 1) * page_size
-        paged_companies = companies[start : start + page_size]
-        self._send(
-            html_page(
-                paged_companies,
-                params,
-                job_state=job_status_snapshot(),
-                total_count=len(companies),
-                page=page,
-                page_size=page_size,
+            page = self._to_int(params, "page", 1, min_value=1)
+            page_size = min(self._to_int(params, "page_size", 200, min_value=1), 1000)
+            start = (page - 1) * page_size
+            paged_companies = companies[start : start + page_size]
+            self._send(
+                html_page(
+                    paged_companies,
+                    params,
+                    job_state=job_status_snapshot(),
+                    total_count=len(companies),
+                    page=page,
+                    page_size=page_size,
+                )
             )
-        )
+
+        self._safe_handle(handler)
 
     def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        if not parsed.path.startswith("/api/run/"):
-            self._send("Not found", status=404)
-            return
-        payload = self._post_params()
-        limit = self._to_int(payload, "limit", ZEFIX_DEFAULT_LIMIT, min_value=1)
-        email_scan = self._to_int(payload, "email_scan", 800, min_value=0)
-        workers = self._to_int(payload, "workers", DEFAULT_WORKERS, min_value=1)
-        timeout = self._to_int(payload, "timeout", 10, min_value=3)
-        discover = self._to_bool(payload, "discover", True)
-        if "seed_sources" in payload:
-            seed_sources = parse_seed_sources(payload.get("seed_sources"), default_on_empty=False)
-            if not seed_sources:
-                self._send("Bitte mindestens eine Seed-Quelle auswaehlen.", status=400)
+        def handler() -> None:
+            parsed = urlparse(self.path)
+            if not parsed.path.startswith("/api/run/"):
+                self._send("Not found", status=404)
                 return
-        else:
-            seed_sources = parse_seed_sources(None)
+            payload = self._post_params()
+            limit = self._to_int(payload, "limit", ZEFIX_DEFAULT_LIMIT, min_value=1)
+            email_scan = self._to_int(payload, "email_scan", 800, min_value=0)
+            workers = self._to_int(payload, "workers", DEFAULT_WORKERS, min_value=1)
+            timeout = self._to_int(payload, "timeout", 10, min_value=3)
+            discover = self._to_bool(payload, "discover", True)
+            if "seed_sources" in payload:
+                seed_sources = parse_seed_sources(payload.get("seed_sources"), default_on_empty=False)
+                if not seed_sources:
+                    self._send("Bitte mindestens eine Seed-Quelle auswaehlen.", status=400)
+                    return
+            else:
+                seed_sources = parse_seed_sources(None)
 
-        def start_seed() -> None:
-            args = argparse.Namespace(
-                data=str(self.dataset_path),
-                out=str(self.dataset_path),
-                limit=limit,
-                workers=workers,
-                seed_sources=seed_sources,
-            )
-            command_seed_zefix(args)
+            def start_seed() -> None:
+                args = argparse.Namespace(
+                    data=str(self.dataset_path),
+                    out=str(self.dataset_path),
+                    limit=limit,
+                    workers=workers,
+                    seed_sources=seed_sources,
+                )
+                command_seed_zefix(args)
 
-        def start_enrich() -> None:
-            args = argparse.Namespace(
-                data=str(self.dataset_path),
-                out=str(self.dataset_path),
-                limit=email_scan,
-                timeout=timeout,
-                discover_websites=discover,
-                workers=workers,
-            )
-            command_enrich(args)
+            def start_enrich() -> None:
+                args = argparse.Namespace(
+                    data=str(self.dataset_path),
+                    out=str(self.dataset_path),
+                    limit=email_scan,
+                    timeout=timeout,
+                    discover_websites=discover,
+                    workers=workers,
+                )
+                command_enrich(args)
 
-        def start_bootstrap() -> None:
-            args = argparse.Namespace(
-                data=str(self.dataset_path),
-                out=str(self.dataset_path),
-                limit=limit,
-                email_scan=email_scan,
-                timeout=timeout,
-                discover_websites=discover,
-                workers=workers,
-                seed_sources=seed_sources,
-            )
-            command_bootstrap(args)
+            def start_bootstrap() -> None:
+                args = argparse.Namespace(
+                    data=str(self.dataset_path),
+                    out=str(self.dataset_path),
+                    limit=limit,
+                    email_scan=email_scan,
+                    timeout=timeout,
+                    discover_websites=discover,
+                    workers=workers,
+                    seed_sources=seed_sources,
+                )
+                command_bootstrap(args)
 
-        action = parsed.path.removeprefix("/api/run/")
-        task_map: dict[str, Callable[[], None]] = {
-            "seed": start_seed,
-            "enrich": start_enrich,
-            "bootstrap": start_bootstrap,
-        }
-        if action not in task_map:
-            self._send("Unbekannte Aktion", status=400)
-            return
-        ok, message = start_background_job(action, task_map[action])
-        status = 202 if ok else 409
-        body = json.dumps({"ok": ok, "message": message, "action": action}, ensure_ascii=False)
-        self._send(body, status=status, content_type="application/json; charset=utf-8")
+            action = parsed.path.removeprefix("/api/run/")
+            task_map: dict[str, Callable[[], None]] = {
+                "seed": start_seed,
+                "enrich": start_enrich,
+                "bootstrap": start_bootstrap,
+            }
+            if action not in task_map:
+                self._send("Unbekannte Aktion", status=400)
+                return
+            ok, message = start_background_job(action, task_map[action])
+            status = 202 if ok else 409
+            body = json.dumps({"ok": ok, "message": message, "action": action}, ensure_ascii=False)
+            self._send(body, status=status, content_type="application/json; charset=utf-8")
+
+        self._safe_handle(handler)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
