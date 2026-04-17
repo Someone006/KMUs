@@ -2838,6 +2838,9 @@ def html_page(
     params: dict[str, str],
     title: str = "KMU Finder",
     job_state: dict[str, object] | None = None,
+    total_count: int | None = None,
+    page: int = 1,
+    page_size: int = 200,
 ) -> str:
     def value(name: str, default: str = "") -> str:
         return html.escape(params.get(name, default))
@@ -3021,8 +3024,33 @@ def html_page(
     }
     """
 
+    shown_count = len(companies)
+    all_count = shown_count if total_count is None else max(int(total_count), 0)
+    safe_page_size = max(int(page_size), 1)
+    total_pages = max(1, (all_count + safe_page_size - 1) // safe_page_size) if all_count else 1
+    current_page = min(max(int(page), 1), total_pages)
+
+    def _page_link(target_page: int, label: str) -> str:
+        qp = {k: v for k, v in params.items() if k != "page"}
+        qp["page"] = str(target_page)
+        qp["page_size"] = str(safe_page_size)
+        return f'<a href="/?{urlencode(qp)}">{label}</a>'
+
+    pagination_parts = []
+    if total_pages > 1:
+        if current_page > 1:
+            pagination_parts.append(_page_link(1, "Erste"))
+            pagination_parts.append(_page_link(current_page - 1, "Zurueck"))
+        pagination_parts.append(f"Seite {current_page} / {total_pages}")
+        if current_page < total_pages:
+            pagination_parts.append(_page_link(current_page + 1, "Weiter"))
+            pagination_parts.append(_page_link(total_pages, "Letzte"))
+    pagination_html = f'<div class="actions">{"".join(pagination_parts)}</div>' if pagination_parts else ""
+
     filter_form = f"""
     <form method="get" class="grid">
+      <input type="hidden" name="page" value="1" />
+      <input type="hidden" name="page_size" value="{safe_page_size}" />
       <input name="name" placeholder="Firmenname" value="{value('name')}" />
       <input name="city" placeholder="Ort" value="{value('city')}" />
       <input name="canton" placeholder="Kanton z.B. ZH" value="{value('canton')}" />
@@ -3033,7 +3061,8 @@ def html_page(
     </form>
     """
 
-    export_query = f"?{urlencode(params)}" if params else ""
+    export_params = {k: v for k, v in params.items() if k not in {"page", "page_size"}}
+    export_query = f"?{urlencode(export_params)}" if export_params else ""
     table_rows = "".join(rows) if rows else '<tr><td colspan="7">Keine Treffer</td></tr>'
     seed_source_options = "".join(
         f'<label><input type="checkbox" class="seed-source" value="{html.escape(source)}" checked /> {html.escape(label)}</label>'
@@ -3112,7 +3141,8 @@ def html_page(
         <a href="/export.csv{export_query}">CSV exportieren</a>
         <a href="/export.xlsx{export_query}">XLSX exportieren</a>
       </div>
-      <div class="hint">Treffer: {len(companies)}</div>
+            <div class="hint">Treffer gesamt: {all_count} | angezeigt: {shown_count} (Seite {current_page} / {total_pages})</div>
+            {pagination_html}
     </section>
 
     <div class="tablewrap">
@@ -3372,7 +3402,20 @@ class KMURequestHandler(BaseHTTPRequestHandler):
             return
         params = self._query_params(parsed.query)
         companies = self._filtered_companies(params)
-        self._send(html_page(companies, params, job_state=job_status_snapshot()))
+        page = self._to_int(params, "page", 1, min_value=1)
+        page_size = min(self._to_int(params, "page_size", 200, min_value=1), 1000)
+        start = (page - 1) * page_size
+        paged_companies = companies[start : start + page_size]
+        self._send(
+            html_page(
+                paged_companies,
+                params,
+                job_state=job_status_snapshot(),
+                total_count=len(companies),
+                page=page,
+                page_size=page_size,
+            )
+        )
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
