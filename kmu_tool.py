@@ -350,6 +350,7 @@ class Company:
     employee_max: int | None = None
     city: str = ""
     canton: str = ""
+    address: str = ""
     website: str = ""
     emails: list[str] = field(default_factory=list)
     source: str = ""
@@ -386,6 +387,7 @@ def company_to_row(company: Company) -> dict[str, str]:
         "employee_label": company.employee_label,
         "city": company.city,
         "canton": company.canton,
+        "address": company.address,
         "website": company.website,
         "emails": ", ".join(company.emails),
         "source": company.source,
@@ -426,6 +428,7 @@ def clone_company(company: Company) -> Company:
         employee_max=company.employee_max,
         city=company.city,
         canton=company.canton,
+        address=company.address,
         website=company.website,
         emails=list(company.emails),
         source=company.source,
@@ -659,7 +662,7 @@ def fetch_zefix_rows(
     started_at = time.monotonic()
     query_template = """PREFIX schema: <http://schema.org/>
 PREFIX admin: <https://schema.ld.admin.ch/>
-SELECT ?company_uri (SAMPLE(?name) AS ?name) (SAMPLE(?company_type) AS ?company_type) (SAMPLE(?muni_id) AS ?municipality_uri) (SAMPLE(?municipality) AS ?municipality) (SAMPLE(?adresse) AS ?adresse) (SAMPLE(?locality) AS ?locality)
+SELECT ?company_uri (SAMPLE(?name) AS ?name) (SAMPLE(?company_type) AS ?company_type) (SAMPLE(?muni_id) AS ?municipality_uri) (SAMPLE(?municipality) AS ?municipality) (SAMPLE(?adresse) AS ?adresse) (SAMPLE(?locality) AS ?locality) (SAMPLE(?postal) AS ?postal)
 WHERE {{
   ?company_uri a admin:ZefixOrganisation ;
     schema:name ?name ;
@@ -670,6 +673,7 @@ WHERE {{
   ?type_id schema:name ?company_type .
   ?adr schema:streetAddress ?adresse ;
       schema:addressLocality ?locality .
+  OPTIONAL {{ ?adr schema:postalCode ?postal . }}
 }}
 GROUP BY ?company_uri
 ORDER BY ?company_uri
@@ -760,6 +764,10 @@ def company_from_zefix_row(row: dict[str, str], canton_map: dict[int, str]) -> C
     municipality_uri = row.get("municipality_uri", "")
     municipality_code = extract_bfs_code(municipality_uri)
     city = (row.get("municipality") or "").strip()
+    street = (row.get("adresse") or "").strip()
+    postal = (row.get("postal") or "").strip()
+    locality = (row.get("locality") or "").strip()
+    address = " ".join(part for part in (street, postal, locality) if part)
     canton = canton_map.get(municipality_code or -1, "")
     company_uri = (row.get("company_uri") or "").strip()
     uid = company_uri.rsplit("/", 1)[-1] if company_uri else ""
@@ -768,6 +776,7 @@ def company_from_zefix_row(row: dict[str, str], canton_map: dict[int, str]) -> C
         legal_form=(row.get("company_type") or "").strip(),
         city=city,
         canton=canton,
+        address=address,
         source="Zefix/LINDAS",
         uid=uid,
     )
@@ -938,6 +947,7 @@ def parse_moneyhouse_seed_companies(html_text: str) -> list[Company]:
         if "|" in address:
             address = address.split("|")[-1].strip()
         address = re.sub(r"^\d{3,4}\s*", "", address)
+        address = sanitize_city_text(address)
         company = Company(
             name=name,
             city=address,
@@ -1652,6 +1662,25 @@ def city_tokens(city: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]{3,}", cleaned))
 
 
+def address_tokens(address: str) -> set[str]:
+    cleaned = re.sub(r"[()\-/,]", " ", normalize_text(address))
+    tokens = set(re.findall(r"[a-z0-9]{3,}", cleaned))
+    blocked = {"strasse", "str", "street", "platz", "weg", "gasse", "postfach", "schweiz"}
+    return {token for token in tokens if token not in blocked}
+
+
+def sanitize_city_text(city: str) -> str:
+    text = (city or "").strip()
+    lowered = normalize_text(text)
+    if not lowered:
+        return ""
+    if lowered.startswith("status:"):
+        return ""
+    if lowered in {"aktiv", "inaktiv", "status", "status aktiv", "status inaktiv"}:
+        return ""
+    return text
+
+
 def company_core_name(company: Company) -> str:
     full_name = normalize_text(company.name)
     short_name = company_search_name(company)
@@ -1679,9 +1708,12 @@ def page_mentions_company_and_city(company: Company, page_text: str) -> bool:
     if token_hits < required_hits and not page_mentions_full_company_name(company, page_text):
         return False
     city_parts = city_tokens(company.city)
-    if not city_parts:
-        return True
-    return any(token in content for token in city_parts)
+    city_match = any(token in content for token in city_parts) if city_parts else False
+    adr_tokens = address_tokens(company.address)
+    adr_match = any(token in content for token in adr_tokens) if adr_tokens else False
+    if city_parts or adr_tokens:
+        return city_match or adr_match
+    return True
 
 
 def website_looks_like_company_site(company: Company, website: str, page_text: str = "") -> bool:
@@ -2105,6 +2137,7 @@ def company_key(company: Company) -> str:
     key_parts = [
         f"name:{normalize_text(company.name)}",
         f"city:{normalize_text(company.city)}",
+        f"address:{normalize_text(company.address)}",
         f"legal:{normalize_text(company.legal_form)}"
     ]
     if website_domain:
@@ -2216,6 +2249,7 @@ def merge_companies(existing: Company | None, incoming: Company) -> Company:
         employee_max=existing.employee_max if existing.employee_max is not None else incoming.employee_max,
         city=existing.city or incoming.city,
         canton=existing.canton or incoming.canton,
+        address=existing.address or incoming.address,
         website=existing.website or incoming.website,
         emails=emails,
         source=merge_source_labels(existing.source, incoming.source),
@@ -2250,6 +2284,7 @@ def sanitize_seed_company(company: Company) -> Company:
         return company
 
     company.emails = sanitize_seed_emails(company)
+    company.city = sanitize_city_text(company.city)
     website = (company.website or "").strip()
     if website:
         parsed = urlparse(website if "://" in website else f"https://{website}")
@@ -2285,6 +2320,7 @@ def company_matches(company: Company, filters: dict[str, str | None]) -> bool:
     name = normalize_text(filters.get("name"))
     legal_form = normalize_text(filters.get("legal_form"))
     city = normalize_text(filters.get("city"))
+    address = normalize_text(filters.get("address"))
     canton = normalize_canton(filters.get("canton"))
     website = normalize_text(filters.get("website"))
     has_email = parse_bool_filter(filters.get("has_email"))
@@ -2296,6 +2332,8 @@ def company_matches(company: Company, filters: dict[str, str | None]) -> bool:
     if not legal_form_matches(legal_form, company.legal_form):
         return False
     if city and city not in normalize_text(company.city):
+        return False
+    if address and address not in normalize_text(company.address):
         return False
     if canton and normalize_canton(company.canton) != canton:
         return False
@@ -2345,6 +2383,7 @@ def load_companies(path: Path) -> list[Company]:
                 employee_max=item.get("employee_max"),
                 city=item.get("city", "").strip(),
                 canton=item.get("canton", "").strip(),
+                address=item.get("address", "").strip(),
                 website=item.get("website", "").strip(),
                 emails=list(item.get("emails", [])),
                 source=item.get("source", "").strip(),
@@ -2397,6 +2436,7 @@ def import_csv(path: Path) -> list[Company]:
                 employee_max=employee_max,
                 city=pick_field(row, "city", "ort", "gemeinde"),
                 canton=normalize_canton(pick_field(row, "canton", "kanton")),
+                address=pick_field(row, "address", "adresse", "strasse", "street"),
                 website=pick_field(row, "website", "url", "webseite"),
                 source=pick_field(row, "source", "quelle"),
                 uid=pick_field(row, "uid", "uidnr", "identifier"),
@@ -2788,6 +2828,7 @@ def render_export_rows(companies: list[Company]) -> list[list[str]]:
                     export_row["employee_label"],
                     export_row["city"],
                     export_row["canton"],
+                    export_row["address"],
                     export_row["website"],
                     export_row["emails"],
                     export_row["source"],
@@ -2798,7 +2839,7 @@ def render_export_rows(companies: list[Company]) -> list[list[str]]:
 
 
 def export_csv_text(companies: list[Company]) -> str:
-    headers = ["name", "legal_form", "employees", "city", "canton", "website", "emails", "source", "uid"]
+    headers = ["name", "legal_form", "employees", "city", "canton", "address", "website", "emails", "source", "uid"]
     buffer = tempfile.SpooledTemporaryFile(mode="w+", encoding="utf-8", newline="")
     writer = csv.writer(buffer)
     writer.writerow(headers)
@@ -2823,7 +2864,7 @@ def column_name(index: int) -> str:
 
 
 def build_xlsx_bytes(companies: list[Company]) -> bytes:
-    headers = ["name", "legal_form", "employees", "city", "canton", "website", "emails", "source", "uid"]
+    headers = ["name", "legal_form", "employees", "city", "canton", "address", "website", "emails", "source", "uid"]
     rows = [headers] + render_export_rows(companies)
 
     sheet_rows = []
@@ -2879,7 +2920,7 @@ def build_xlsx_bytes(companies: list[Company]) -> bytes:
 
 
 def format_table(rows: list[Company]) -> str:
-    headers = ["Name", "Rechtsform", "Mitarbeiter", "Ort", "Kanton", "Website", "Emails"]
+    headers = ["Name", "Rechtsform", "Mitarbeiter", "Ort", "Kanton", "Adresse", "Website", "Emails"]
     columns = [headers[:]]
     for company in rows:
         columns.append(
@@ -2889,6 +2930,7 @@ def format_table(rows: list[Company]) -> str:
                 company.employee_label,
                 company.city,
                 company.canton,
+                company.address,
                 company.website,
                 ", ".join(company.emails),
             ]
@@ -2927,6 +2969,7 @@ def html_page(
             f"<td>{html.escape(company.employee_label)}</td>"
             f"<td>{html.escape(company.city)}</td>"
             f"<td>{html.escape(company.canton)}</td>"
+            f"<td>{html.escape(company.address)}</td>"
             f"<td>{website_html}</td>"
             f"<td>{email_html}</td>"
             "</tr>"
@@ -3122,6 +3165,7 @@ def html_page(
       <input type="hidden" name="page_size" value="{safe_page_size}" />
       <input name="name" placeholder="Firmenname" value="{value('name')}" />
       <input name="city" placeholder="Ort" value="{value('city')}" />
+            <input name="address" placeholder="Adresse" value="{value('address')}" />
       <input name="canton" placeholder="Kanton z.B. ZH" value="{value('canton')}" />
       <input name="legal_form" placeholder="Rechtsform" value="{value('legal_form')}" />
     <input name="employees" placeholder="Mitarbeiter z.B. 10+ oder 50-200" value="{value('employees')}" />
@@ -3132,7 +3176,7 @@ def html_page(
 
     export_params = {k: v for k, v in params.items() if k not in {"page", "page_size"}}
     export_query = f"?{urlencode(export_params)}" if export_params else ""
-    table_rows = "".join(rows) if rows else '<tr><td colspan="7">Keine Treffer</td></tr>'
+    table_rows = "".join(rows) if rows else '<tr><td colspan="8">Keine Treffer</td></tr>'
     seed_source_options = "".join(
         f'<label><input type="checkbox" class="seed-source" value="{html.escape(source)}" checked /> {html.escape(label)}</label>'
         for source, label in SEED_SOURCE_LABELS.items()
@@ -3216,9 +3260,9 @@ def html_page(
 
     <div class="tablewrap">
       <table>
-        <thead>
-          <tr><th>Name</th><th>Rechtsform</th><th>Mitarbeiter</th><th>Ort</th><th>Kanton</th><th>Website</th><th>Emails</th></tr>
-        </thead>
+                <thead>
+                    <tr><th>Name</th><th>Rechtsform</th><th>Mitarbeiter</th><th>Ort</th><th>Kanton</th><th>Adresse</th><th>Website</th><th>Emails</th></tr>
+                </thead>
         <tbody>{table_rows}</tbody>
       </table>
     </div>
@@ -3639,6 +3683,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--legal-form", default="")
     search_parser.add_argument("--employees", default="")
     search_parser.add_argument("--city", default="")
+    search_parser.add_argument("--address", default="")
     search_parser.add_argument("--canton", default="")
     search_parser.add_argument("--website", default="")
     search_parser.add_argument("--has-email", default="")
@@ -3658,6 +3703,7 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--legal-form", default="")
     export_parser.add_argument("--employees", default="")
     export_parser.add_argument("--city", default="")
+    export_parser.add_argument("--address", default="")
     export_parser.add_argument("--canton", default="")
     export_parser.add_argument("--website", default="")
     export_parser.add_argument("--has-email", default="")
@@ -3819,6 +3865,7 @@ def command_search(args: argparse.Namespace) -> int:
         "legal_form": args.legal_form,
         "employees": args.employees,
         "city": args.city,
+        "address": args.address,
         "canton": args.canton,
         "website": args.website,
         "has_email": args.has_email,
@@ -3890,6 +3937,7 @@ def command_export(args: argparse.Namespace) -> int:
         "legal_form": args.legal_form,
         "employees": args.employees,
         "city": args.city,
+        "address": args.address,
         "canton": args.canton,
         "website": args.website,
         "has_email": args.has_email,
