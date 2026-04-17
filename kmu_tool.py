@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import tempfile
@@ -1743,6 +1744,78 @@ def validate_company_emails(
     return sorted(valid)
 
 
+def domain_resolves(domain: str) -> bool:
+    try:
+        socket.getaddrinfo(domain, None)
+        return True
+    except Exception:
+        return False
+
+
+def validate_company_emails_second_pass(
+    company: Company,
+    website: str,
+    emails: Iterable[str],
+    page_text: str = "",
+) -> list[str]:
+    parsed = urlparse(website if "://" in website else f"https://{website}")
+    host = host_without_port(parsed.netloc)
+    if not host or is_blocked_foreign_domain(host):
+        return []
+
+    allowed_domain = root_domain(host)
+    strong_content_match = page_mentions_company_and_city(company, page_text)
+    name_tokens = {token for token in company_name_tokens(company.name) if len(token) >= 4}
+    checked: set[str] = set()
+    for email in emails:
+        candidate = normalize_text(email).lower()
+        if not EMAIL_RE.fullmatch(candidate):
+            continue
+        domain = candidate.rsplit("@", 1)[-1]
+        if domain in EMAIL_DOMAIN_BLOCKLIST:
+            continue
+        if domain in FREE_EMAIL_DOMAINS:
+            continue
+        if domain.rsplit(".", 1)[-1] in FALSE_EMAIL_DOMAIN_SUFFIXES:
+            continue
+        if is_blocked_foreign_domain(domain):
+            continue
+        if not domain_resolves(domain):
+            continue
+
+        same_website_domain = domain == allowed_domain or domain.endswith("." + allowed_domain)
+        if same_website_domain:
+            checked.add(candidate)
+            continue
+
+        # Ausnahme nur fuer starke Treffer auf .ch-Domains.
+        if host_tld(domain) != "ch":
+            continue
+        if not strong_content_match:
+            continue
+        domain_blob = re.sub(r"[^a-z0-9]+", "", root_domain(domain))
+        if not any(token in domain_blob for token in name_tokens):
+            continue
+        checked.add(candidate)
+
+    return sorted(checked)
+
+
+def double_validate_company_emails(
+    company: Company,
+    website: str,
+    emails: Iterable[str],
+    page_text: str = "",
+) -> list[str]:
+    first_pass = set(validate_company_emails(company, website, emails, page_text=page_text))
+    if not first_pass:
+        return []
+    second_pass = set(validate_company_emails_second_pass(company, website, first_pass, page_text=page_text))
+    if not second_pass:
+        return []
+    return sorted(first_pass.intersection(second_pass))
+
+
 def discover_website(company: Company, timeout: int = 20) -> str:
     global SEARCH_DISCOVERY_DISABLED
     if job_should_stop():
@@ -1846,8 +1919,12 @@ def enrich_company_record(company: Company, timeout: int = 10, discover_sites: b
         else:
             stats["websites_found"] = 1
 
+            # Bereits vorhandene E-Mails immer neu pruefen (Pass 1 + Pass 2).
+            existing_valid = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
+            working.emails = keep_consistent_email_domains(existing_valid)
+
             def email_validator(email: str, page_text: str) -> bool:
-                return bool(validate_company_emails(working, website, [email], page_text=page_text))
+                return bool(double_validate_company_emails(working, website, [email], page_text=page_text))
 
             contact_found = crawl_contact_pages(website, homepage_text, timeout=timeout, email_validator=email_validator)
             if contact_found:
@@ -1857,15 +1934,18 @@ def enrich_company_record(company: Company, timeout: int = 10, discover_sites: b
                 if not working.source:
                     working.source = "website contact"
 
-            if not working.emails:
-                found = crawl_public_emails(website, timeout=timeout, email_validator=email_validator)
-                found = validate_company_emails(working, website, found, page_text=homepage_text)
-                if found:
-                    working.emails = sorted(set(working.emails).union(found))
-                    working.emails = keep_consistent_email_domains(working.emails)
-                    stats["emails_found"] = len(found)
-                    if not working.source:
-                        working.source = "website crawl"
+            found = crawl_public_emails(website, timeout=timeout, email_validator=email_validator)
+            found = double_validate_company_emails(working, website, found, page_text=homepage_text)
+            if found:
+                working.emails = sorted(set(working.emails).union(found))
+                working.emails = keep_consistent_email_domains(working.emails)
+                stats["emails_found"] += len(found)
+                if not working.source:
+                    working.source = "website crawl"
+
+            # Finale doppelte Validierung fuer gesamten Satz.
+            working.emails = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
+            working.emails = keep_consistent_email_domains(working.emails)
 
     if not working.emails:
         localch_emails = discover_localch_emails(working, timeout=timeout)
@@ -3714,8 +3794,6 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         pending: list[Company] = []
         for company in companies[:scan_count]:
             existing = stored_companies.get(company_key(company))
-            if existing and existing.emails:
-                continue
             pending.append(merge_companies(existing, company))
 
         job_update(
