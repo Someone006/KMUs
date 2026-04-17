@@ -1652,12 +1652,31 @@ def city_tokens(city: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]{3,}", cleaned))
 
 
+def company_core_name(company: Company) -> str:
+    full_name = normalize_text(company.name)
+    short_name = company_search_name(company)
+    return short_name if len(short_name) >= 6 else full_name
+
+
+def page_mentions_full_company_name(company: Company, page_text: str) -> bool:
+    content = normalize_text(page_text)
+    if not content:
+        return False
+    full_name = normalize_text(company.name)
+    core_name = company_core_name(company)
+    return (full_name and full_name in content) or (core_name and core_name in content)
+
+
 def page_mentions_company_and_city(company: Company, page_text: str) -> bool:
     content = normalize_text(page_text)
     if not content:
         return False
-    name_match = any(token in content for token in company_name_tokens(company.name))
-    if not name_match:
+    name_tokens = [token for token in company_name_tokens(company.name) if len(token) >= 4]
+    if not name_tokens:
+        return page_mentions_full_company_name(company, page_text)
+    token_hits = sum(1 for token in name_tokens if token in content)
+    required_hits = 2 if len(name_tokens) >= 2 else 1
+    if token_hits < required_hits and not page_mentions_full_company_name(company, page_text):
         return False
     city_parts = city_tokens(company.city)
     if not city_parts:
@@ -1680,14 +1699,17 @@ def website_looks_like_company_site(company: Company, website: str, page_text: s
     if domain in FREE_EMAIL_DOMAINS:
         return False
     token_blob = re.sub(r"[^a-z0-9]+", "", domain)
-    for token in company_name_tokens(company.name):
-        if token in token_blob or token_blob in token:
-            return True
-    # .ch-Ausnahme: klarer Name+Ort-Inhalt reicht auch bei anderer Domain.
-    if host_tld(host) == "ch" and page_mentions_company_and_city(company, page_text):
+    content_match = page_mentions_company_and_city(company, page_text)
+    full_name_match = page_mentions_full_company_name(company, page_text)
+    domain_token_match = any(token in token_blob or token_blob in token for token in company_name_tokens(company.name))
+
+    # Hohe Präzision: Domain-Hinweis allein reicht nicht, es braucht zusätzlich Inhalts-Match.
+    if domain_token_match and content_match:
         return True
-    # Für andere TLDs bleibt die Inhaltsprüfung wie bisher streng.
-    return page_mentions_company_and_city(company, page_text)
+    # Alternative: klarer Vollname + Ortsbezug im Inhalt.
+    if full_name_match and content_match:
+        return True
+    return False
 
 
 def validate_company_emails(
@@ -1701,9 +1723,6 @@ def validate_company_emails(
     if is_blocked_foreign_domain(host):
         return []
     allowed_domain = root_domain(host)
-    strong_content_match = page_mentions_company_and_city(company, page_text)
-    directory_mode = any(host.endswith(blocked) or host == blocked for blocked in SEARCH_BLOCKLIST)
-    name_tokens = {token for token in company_name_tokens(company.name) if len(token) >= 4}
     valid: set[str] = set()
     for email in emails:
         candidate = normalize_text(email).lower()
@@ -1721,26 +1740,8 @@ def validate_company_emails(
             valid.add(candidate)
             continue
 
-        if directory_mode:
-            # Bei Verzeichnis-Seiten (z.B. local.ch/search.ch) nur sehr strenge Zuordnung:
-            # .ch Domain, Firmenname auf Seite bestaetigt und Domain enthaelt Firmen-Token.
-            if domain in FREE_EMAIL_DOMAINS:
-                continue
-            if host_tld(domain) != "ch":
-                continue
-            if not strong_content_match:
-                continue
-            domain_blob = re.sub(r"[^a-z0-9]+", "", root_domain(domain))
-            if not any(token in domain_blob for token in name_tokens):
-                continue
-            valid.add(candidate)
-            continue
-
-        if not domain_matches_website:
-            if domain in FREE_EMAIL_DOMAINS:
-                continue
-            # Fuer normale Firmen-Websites keine Cross-Domain-Akzeptanz.
-            continue
+        # Hohe Präzision: keine Cross-Domain-Akzeptanz.
+        continue
     return sorted(valid)
 
 
@@ -1821,8 +1822,12 @@ def discover_website(company: Company, timeout: int = 20) -> str:
     if job_should_stop():
         return ""
     search_name = company_search_name(company)
+    full_name = normalize_text(company.name)
     city = company.city.strip()
     query_variants = [
+        f'"{full_name}" "{city}" site:.ch' if city else f'"{full_name}" site:.ch',
+        f'"{full_name}" impressum site:.ch',
+        f'"{full_name}" kontakt site:.ch',
         f'"{search_name}" site:.ch',
         f'{search_name} site:.ch',
         f'"{search_name}" {city} site:.ch' if city else f'"{search_name}" site:.ch',
@@ -1946,23 +1951,9 @@ def enrich_company_record(company: Company, timeout: int = 10, discover_sites: b
             # Finale doppelte Validierung fuer gesamten Satz.
             working.emails = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
             working.emails = keep_consistent_email_domains(working.emails)
-
-    if not working.emails:
-        localch_emails = discover_localch_emails(working, timeout=timeout)
-        if localch_emails:
-            working.emails = sorted(set(working.emails).union(localch_emails))
-            working.emails = keep_consistent_email_domains(working.emails)
-            stats["emails_found"] += len(localch_emails)
-            if not working.source:
-                working.source = "local.ch"
-    if not working.emails:
-        search_emails = discover_company_emails_via_search(working, timeout=timeout)
-        if search_emails:
-            working.emails = sorted(set(working.emails).union(search_emails))
-            working.emails = keep_consistent_email_domains(working.emails)
-            stats["emails_found"] += len(search_emails)
-            if not working.source:
-                working.source = "web search"
+    else:
+        # Ohne verifizierte Firmen-Website behalten wir keine unsicheren Alt-E-Mails.
+        working.emails = []
 
     if not working.website and working.emails:
         inferred_website = infer_website_from_emails(working.emails)
@@ -2560,40 +2551,8 @@ def verify_candidate_website(company: Company, candidate: str, timeout: int = 20
 
 
 def discover_localch_emails(company: Company, timeout: int = 12) -> list[str]:
-    if job_should_stop():
-        return []
-    search_query = company_search_name(company)
-    location = company.city or "Switzerland"
-    search_url = LOCALCH_SEARCH_URL.format(query=quote_plus(search_query), where=quote_plus(location))
-    try:
-        search_text = safe_get_text(search_url, timeout=timeout, retries=2)
-    except Exception:
-        return []
-
-    detail_urls: list[str] = []
-    for raw_path in re.findall(r'/[a-z]{2}/d/[^"\\< ]+', search_text):
-        absolute = urljoin(search_url, raw_path)
-        if absolute not in detail_urls:
-            detail_urls.append(absolute)
-    if not detail_urls:
-        return []
-
-    emails: set[str] = set()
-    for detail_url in detail_urls[:6]:
-        if job_should_stop():
-            break
-        try:
-            detail_text, _ = fetch_html(detail_url, timeout=timeout)
-        except Exception:
-            continue
-        if not detail_text:
-            continue
-        if not page_mentions_company_and_city(company, detail_text) and search_query not in normalize_text(detail_text):
-            continue
-        found = extract_emails_from_text(detail_text)
-        valid = validate_company_emails(company, "https://www.local.ch", found, page_text=detail_text)
-        emails.update(valid)
-    return sorted(emails)
+    # Für hohe Datenqualität werden Verzeichnis-E-Mails nicht direkt übernommen.
+    return []
 
 
 def discover_company_emails_via_search(company: Company, timeout: int = 12) -> list[str]:
@@ -2602,8 +2561,11 @@ def discover_company_emails_via_search(company: Company, timeout: int = 12) -> l
         return []
 
     search_name = company_search_name(company)
+    full_name = normalize_text(company.name)
     city = company.city.strip()
     query_variants = [
+        f'"{full_name}" "{city}" kontakt email' if city else f'"{full_name}" kontakt email',
+        f'"{full_name}" impressum email',
         f'"{search_name}" email',
         f'"{search_name}" kontakt email',
         f'"{search_name}" {city} kontakt email' if city else f'"{search_name}" kontakt email',
@@ -2666,7 +2628,7 @@ def discover_company_emails_via_search(company: Company, timeout: int = 12) -> l
             host_blob = re.sub(r"[^a-z0-9]+", "", host)
             if not any(token in host_blob for token in company_name_tokens(company.name)):
                 return []
-        return validate_company_emails(company, target_url, extract_emails_from_text(page_text), page_text=page_text)
+        return double_validate_company_emails(company, target_url, extract_emails_from_text(page_text), page_text=page_text)
 
     if top_candidates:
         with ThreadPoolExecutor(max_workers=min(4, len(top_candidates))) as executor:
