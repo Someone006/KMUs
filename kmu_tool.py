@@ -2245,8 +2245,24 @@ def company_matches(company: Company, filters: dict[str, str | None]) -> bool:
 def load_companies(path: Path) -> list[Company]:
     if not path.exists():
         return []
-    with path.open("r", encoding="utf-8") as handle:
-        raw = json.load(handle)
+
+    def _load_json(candidate: Path) -> list[dict]:
+        with candidate.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, list):
+            raise ValueError(f"Unerwartetes JSON-Format in {candidate}")
+        return data
+
+    raw: list[dict]
+    try:
+        raw = _load_json(path)
+    except Exception:
+        backup_path = path.with_suffix(f"{path.suffix}.bak")
+        if backup_path.exists():
+            raw = _load_json(backup_path)
+        else:
+            raise
+
     companies: list[Company] = []
     for item in raw:
         companies.append(
@@ -2268,9 +2284,19 @@ def load_companies(path: Path) -> list[Company]:
 
 def save_companies(path: Path, companies: Iterable[Company]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(list(companies), handle, ensure_ascii=False, indent=2, cls=CompanyEncoder)
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    backup_path = path.with_suffix(f"{path.suffix}.bak")
+    payload = list(companies)
+
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, cls=CompanyEncoder)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    if path.exists():
+        os.replace(path, backup_path)
+    os.replace(tmp_path, path)
 
 
 def pick_field(row: dict[str, str], *names: str) -> str:
