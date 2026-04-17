@@ -1934,6 +1934,7 @@ def discover_website(company: Company, timeout: int = 20) -> str:
 
 def enrich_company_record(company: Company, timeout: int = 10, discover_sites: bool = False) -> tuple[Company, dict[str, int]]:
     working = clone_company(company)
+    working.city = sanitize_city_text(working.city)
     stats = {"websites_found": 0, "emails_found": 0, "errors": 0}
     if job_should_stop():
         return working, stats
