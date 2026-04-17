@@ -224,9 +224,9 @@ python3 kmu_tool.py import-csv companies.example.csv --out companies.json
 
 ## Was das Tool macht
 
-Das Tool crawlt nur öffentlich erreichbare Seiten wie Startseite, Kontakt oder Impressum und sammelt daraus sichtbare E-Mail-Adressen. Es greift nicht auf versteckte oder personenbezogene Quellen zu. Zusätzlich sucht es bei Zefix-Firmen per Websuche nach der offiziellen Website und nach Kontaktseiten mit E-Mail-Adresse.
+Das Tool baut Firmen standardmässig zuerst aus Zefix auf, übernimmt Zefix-Adressen in bestehende Datensätze und prüft danach Websites sowie Kontaktseiten auf sichtbare E-Mail-Adressen. Es greift nicht auf versteckte oder personenbezogene Quellen zu.
 
-Zusätzlich nutzt das Tool Schweizer Verzeichniseinträge als Fallback, wenn keine passende E-Mail auf der Firmenwebsite gefunden wird. Dabei werden nur Firmenadressen akzeptiert; Verzeichnis- oder Serviceadressen werden verworfen.
+Wenn auf der Firmenwebsite keine passende E-Mail gefunden wird, nutzt das Tool zusätzlich Suchmaschinen-Treffer, inklusive Google als letzten Prüfpass, um offizielle Websites und Kontaktseiten zu finden. Dabei werden nur Firmenadressen akzeptiert; Verzeichnis- oder Serviceadressen werden verworfen.
 
 Zusätzlich validiert das Tool Treffer streng:
 

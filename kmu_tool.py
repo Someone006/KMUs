@@ -30,6 +30,8 @@ from urllib.request import Request, urlopen
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 MAILTO_RE = re.compile(r"mailto:([^\'\"\s>]+)", re.IGNORECASE)
+TEL_RE = re.compile(r"tel:([^\'\"\s>]+)", re.IGNORECASE)
+PHONE_RE = re.compile(r"(?:\+41|0041|0)(?:[\s./-]*\d){8,12}")
 CANTON_ALIASES = {
     "ag": "AG",
     "aargau": "AG",
@@ -233,10 +235,27 @@ JOB_STOP_EVENT = threading.Event()
 LEGAL_FORM_KEYWORDS: dict[str, tuple[str, ...]] = {
     "AG": ("ag", "aktiengesellschaft", "societe anonyme", "société anonyme"),
     "GMBH": ("gmbh", "gesellschaft mit beschrankter haftung", "gesellschaft mit beschränkter haftung", "sarl", "sàrl", "srl"),
+    "KOLLEKTIVGESELLSCHAFT": ("kollektivgesellschaft", "collective company", "societe en nom collectif", "société en nom collectif"),
+    "KOMMANDITGESELLSCHAFT": ("kommanditgesellschaft", "limited partnership", "societe en commandite", "société en commandite"),
+    "ZWEIGNIEDERLASSUNG": ("zweigniederlassung", "branch", "succursale"),
     "GENOSSENSCHAFT": ("genossenschaft", "cooperative", "coop"),
     "EINZELUNTERNEHMEN": ("einzelunternehmen", "raison individuelle", "ditta individuale"),
     "VEREIN": ("verein", "association"),
     "STIFTUNG": ("stiftung", "fondation", "fondazione"),
+}
+LEGAL_FORM_DE_MAP: dict[str, str] = {
+    "AG": "Aktiengesellschaft",
+    "GMBH": "Gesellschaft mit beschraenkter Haftung",
+    "SA": "Aktiengesellschaft",
+    "SARL": "Gesellschaft mit beschraenkter Haftung",
+    "SAGL": "Gesellschaft mit beschraenkter Haftung",
+    "KOLLEKTIVGESELLSCHAFT": "Kollektivgesellschaft",
+    "KOMMANDITGESELLSCHAFT": "Kommanditgesellschaft",
+    "ZWEIGNIEDERLASSUNG": "Zweigniederlassung",
+    "GENOSSENSCHAFT": "Genossenschaft",
+    "EINZELUNTERNEHMEN": "Einzelunternehmen",
+    "VEREIN": "Verein",
+    "STIFTUNG": "Stiftung",
 }
 SEARCHCH_SEED_BASE_TERMS = (
     "ag",
@@ -301,12 +320,6 @@ LOCALCH_SEED_WHERE_TERMS = (
 WEB_SEED_BASE_TERMS = SEARCHCH_SEED_BASE_TERMS
 DEFAULT_SEED_SOURCES = (
     "zefix",
-    "search.ch",
-    "tel.search.ch",
-    "local.ch",
-    "local.ch.ch",
-    "moneyhouse",
-    "swissguide",
 )
 SEED_SOURCE_LABELS = {
     "zefix": "Zefix",
@@ -351,7 +364,9 @@ class Company:
     city: str = ""
     canton: str = ""
     address: str = ""
+    postal_code: str = ""
     website: str = ""
+    phone: str = ""
     emails: list[str] = field(default_factory=list)
     source: str = ""
     uid: str = ""
@@ -382,13 +397,16 @@ def company_to_row(company: Company) -> dict[str, str]:
     return {
         "name": company.name,
         "legal_form": company.legal_form,
+        "legal_form_de": legal_form_to_german(company.legal_form),
         "employee_min": "" if company.employee_min is None else str(company.employee_min),
         "employee_max": "" if company.employee_max is None else str(company.employee_max),
         "employee_label": company.employee_label,
         "city": company.city,
         "canton": company.canton,
         "address": company.address,
+        "postal_code": company.postal_code,
         "website": company.website,
+        "phone": company.phone,
         "emails": ", ".join(company.emails),
         "source": company.source,
         "uid": company.uid,
@@ -429,7 +447,9 @@ def clone_company(company: Company) -> Company:
         city=company.city,
         canton=company.canton,
         address=company.address,
+        postal_code=company.postal_code,
         website=company.website,
+        phone=company.phone,
         emails=list(company.emails),
         source=company.source,
         uid=company.uid,
@@ -763,11 +783,12 @@ OFFSET {offset}"""
 def company_from_zefix_row(row: dict[str, str], canton_map: dict[int, str]) -> Company:
     municipality_uri = row.get("municipality_uri", "")
     municipality_code = extract_bfs_code(municipality_uri)
-    city = (row.get("municipality") or "").strip()
+    municipality = (row.get("municipality") or "").strip()
     street = (row.get("adresse") or "").strip()
     postal = (row.get("postal") or "").strip()
     locality = (row.get("locality") or "").strip()
-    address = " ".join(part for part in (street, postal, locality) if part)
+    city = locality or municipality
+    address = street
     canton = canton_map.get(municipality_code or -1, "")
     company_uri = (row.get("company_uri") or "").strip()
     uid = company_uri.rsplit("/", 1)[-1] if company_uri else ""
@@ -777,6 +798,7 @@ def company_from_zefix_row(row: dict[str, str], canton_map: dict[int, str]) -> C
         city=city,
         canton=canton,
         address=address,
+        postal_code=postal,
         source="Zefix/LINDAS",
         uid=uid,
     )
@@ -1006,10 +1028,14 @@ def parse_search_engine_seed_companies(provider: str, html_text: str, base_url: 
         title = normalize_result_title(title_html)
         if not title or len(title) < 3 or not looks_like_company_name(title):
             continue
-        candidate = decode_ddg_url(href.replace("&amp;", "&")) if provider_key == "ddg" else decode_bing_url(href)
-        if provider_key == "google" and candidate.startswith("/url?"):
-            parsed = urlparse(candidate)
-            candidate = (parse_qs(parsed.query).get("q") or [candidate])[0]
+        if provider_key == "ddg":
+            candidate = decode_ddg_url(href.replace("&amp;", "&"))
+        elif provider_key == "bing":
+            candidate = decode_bing_url(href)
+        elif provider_key == "google":
+            candidate = decode_google_url(href)
+        else:
+            candidate = href
         parsed = urlparse(candidate if "://" in candidate else urljoin(base_url, candidate))
         host = parsed.netloc.lower()
         if host and (host in SEARCH_BLOCKLIST or is_blocked_foreign_domain(host)):
@@ -1028,6 +1054,15 @@ def parse_search_engine_seed_companies(provider: str, html_text: str, base_url: 
         seen.add(key)
         companies.append(company)
     return companies
+
+
+def decode_google_url(raw_url: str) -> str:
+    candidate = raw_url.replace("&amp;", "&")
+    if not candidate.startswith("/url?"):
+        return candidate
+    parsed = urlparse(candidate)
+    params = parse_qs(parsed.query)
+    return (params.get("q") or params.get("url") or [candidate])[0]
 
 
 def build_searchch_seed_terms(limit: int, max_queries: int | None = None) -> list[str]:
@@ -1481,7 +1516,7 @@ def seed_from_multi_sources(
     search_limit = limit
     local_limit = limit
     web_limit = limit
-    source_results: dict[str, list[Company]] = {source: [] for source in DEFAULT_SEED_SOURCES}
+    source_results: dict[str, list[Company]] = {source: [] for source in SEED_SOURCE_LABELS}
 
     def zefix_progress(processed: int, total: int, current: str) -> None:
         if on_progress is not None:
@@ -1655,6 +1690,11 @@ def company_search_name(company: Company) -> str:
         cleaned = re.sub(rf"\b{re.escape(token)}\b", " ", cleaned)
     cleaned = " ".join(cleaned.split())
     return cleaned or name_text
+
+
+def company_location_hint(company: Company) -> str:
+    parts = [company.address.strip(), company.city.strip()]
+    return " ".join(part for part in parts if part)
 
 
 def city_tokens(city: str) -> set[str]:
@@ -1856,14 +1896,16 @@ def discover_website(company: Company, timeout: int = 20) -> str:
     search_name = company_search_name(company)
     full_name = normalize_text(company.name)
     city = company.city.strip()
+    location = company_location_hint(company)
     query_variants = [
-        f'"{full_name}" "{city}" site:.ch' if city else f'"{full_name}" site:.ch',
+        f'"{full_name}" "{location}" site:.ch' if location else f'"{full_name}" site:.ch',
         f'"{full_name}" impressum site:.ch',
         f'"{full_name}" kontakt site:.ch',
-        f'"{search_name}" site:.ch',
+        f'"{search_name}" "{location}" site:.ch' if location else f'"{search_name}" site:.ch',
         f'{search_name} site:.ch',
         f'"{search_name}" {city} site:.ch' if city else f'"{search_name}" site:.ch',
         f'{search_name} {city} site:.ch' if city else f'{search_name} site:.ch',
+        f'"{search_name}" "{location}" kontakt site:.ch' if location else f'"{search_name}" kontakt site:.ch',
         f'"{search_name}" Kontakt site:.ch',
         f'"{search_name}" Impressum site:.ch',
     ]
@@ -1872,6 +1914,9 @@ def discover_website(company: Company, timeout: int = 20) -> str:
         for query in query_variants
     ] + [
         ("bing", BING_SEARCH_URL.format(query=quote_plus(query)), r'<li class="b_algo".*?<a[^>]*href="([^"]+)"')
+        for query in query_variants
+    ] + [
+        ("google", GOOGLE_SEARCH_URL.format(query=quote_plus(query)), r'href="(/url\?[^\"]+)"')
         for query in query_variants
     ]
     search_results: dict[str, str] = {}
@@ -1900,7 +1945,12 @@ def discover_website(company: Company, timeout: int = 20) -> str:
             continue
         result_urls = re.findall(pattern, html_text, flags=re.S)
         for raw_url in result_urls:
-            candidate = decode_ddg_url(raw_url.replace("&amp;", "&")) if provider == "ddg" else decode_bing_url(raw_url)
+            if provider == "ddg":
+                candidate = decode_ddg_url(raw_url.replace("&amp;", "&"))
+            elif provider == "bing":
+                candidate = decode_bing_url(raw_url)
+            else:
+                candidate = decode_google_url(raw_url)
             parsed = urlparse(candidate)
             host = parsed.netloc.lower()
             if not host or is_blocked_foreign_domain(host):
@@ -1936,6 +1986,59 @@ def enrich_company_record(company: Company, timeout: int = 10, discover_sites: b
     working = clone_company(company)
     working.city = sanitize_city_text(working.city)
     stats = {"websites_found": 0, "emails_found": 0, "errors": 0}
+
+    def apply_verified_website(website: str) -> str:
+        try:
+            homepage_text, _ = fetch_html(website, timeout=timeout)
+        except Exception:
+            homepage_text = ""
+        if not website_looks_like_company_site(working, website, page_text=homepage_text):
+            return ""
+
+        stats["websites_found"] = 1
+        homepage_phones = extract_phones_from_text(homepage_text)
+        if homepage_phones and not working.phone:
+            working.phone = homepage_phones[0]
+
+        existing_valid = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
+        working.emails = keep_consistent_email_domains(existing_valid)
+
+        def email_validator(email: str, page_text: str) -> bool:
+            return bool(double_validate_company_emails(working, website, [email], page_text=page_text))
+
+        contact_found = crawl_contact_pages(website, homepage_text, timeout=timeout, email_validator=email_validator)
+        if contact_found:
+            working.emails = sorted(set(working.emails).union(contact_found))
+            working.emails = keep_consistent_email_domains(working.emails)
+            stats["emails_found"] += len(contact_found)
+            if not working.source:
+                working.source = "website contact"
+
+        for contact_url in discover_contact_pages(website, homepage_text):
+            try:
+                contact_text, _ = fetch_html(contact_url, timeout=timeout)
+            except Exception:
+                continue
+            if not contact_text:
+                continue
+            contact_phones = extract_phones_from_text(contact_text)
+            if contact_phones and not working.phone:
+                working.phone = contact_phones[0]
+                break
+
+        found = crawl_public_emails(website, timeout=timeout, email_validator=email_validator)
+        found = double_validate_company_emails(working, website, found, page_text=homepage_text)
+        if found:
+            working.emails = sorted(set(working.emails).union(found))
+            working.emails = keep_consistent_email_domains(working.emails)
+            stats["emails_found"] += len(found)
+            if not working.source:
+                working.source = "website crawl"
+
+        working.emails = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
+        working.emails = keep_consistent_email_domains(working.emails)
+        return website
+
     if job_should_stop():
         return working, stats
     website = working.website
@@ -1947,52 +2050,35 @@ def enrich_company_record(company: Company, timeout: int = 10, discover_sites: b
         if website:
             working.website = website
 
+    search_emails: list[str] = []
+    if not working.phone or not website:
+        search_emails, search_phones, search_website = discover_company_contacts_via_search(working, timeout=timeout)
+        if search_phones and not working.phone:
+            working.phone = search_phones[0]
+        if search_website and not website:
+            website = search_website
+            working.website = search_website
+
     if website:
-        try:
-            homepage_text, _ = fetch_html(website, timeout=timeout)
-        except Exception:
-            homepage_text = ""
-        if not website_looks_like_company_site(working, website, page_text=homepage_text):
-            working.website = ""
-        else:
-            stats["websites_found"] = 1
-
-            # Bereits vorhandene E-Mails immer neu pruefen (Pass 1 + Pass 2).
-            existing_valid = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
-            working.emails = keep_consistent_email_domains(existing_valid)
-
-            def email_validator(email: str, page_text: str) -> bool:
-                return bool(double_validate_company_emails(working, website, [email], page_text=page_text))
-
-            contact_found = crawl_contact_pages(website, homepage_text, timeout=timeout, email_validator=email_validator)
-            if contact_found:
-                working.emails = sorted(set(working.emails).union(contact_found))
-                working.emails = keep_consistent_email_domains(working.emails)
-                stats["emails_found"] += len(contact_found)
-                if not working.source:
-                    working.source = "website contact"
-
-            found = crawl_public_emails(website, timeout=timeout, email_validator=email_validator)
-            found = double_validate_company_emails(working, website, found, page_text=homepage_text)
-            if found:
-                working.emails = sorted(set(working.emails).union(found))
-                working.emails = keep_consistent_email_domains(working.emails)
-                stats["emails_found"] += len(found)
-                if not working.source:
-                    working.source = "website crawl"
-
-            # Finale doppelte Validierung fuer gesamten Satz.
-            working.emails = double_validate_company_emails(working, website, working.emails, page_text=homepage_text)
-            working.emails = keep_consistent_email_domains(working.emails)
-    else:
-        # Ohne verifizierte Firmen-Website behalten wir keine unsicheren Alt-E-Mails.
-        working.emails = []
+        working.website = apply_verified_website(website)
 
     if not working.website and working.emails:
         inferred_website = infer_website_from_emails(working.emails)
         if inferred_website:
-            working.website = inferred_website
-            stats["websites_found"] = 1
+            working.website = apply_verified_website(inferred_website)
+
+    if not working.website:
+        if not search_emails:
+            search_emails, search_phones, search_website = discover_company_contacts_via_search(working, timeout=timeout)
+            if search_phones and not working.phone:
+                working.phone = search_phones[0]
+            if search_website and not working.website:
+                working.website = apply_verified_website(search_website)
+        if search_emails:
+            working.emails = keep_consistent_email_domains(search_emails)
+            stats["emails_found"] += len(search_emails)
+            if not working.source:
+                working.source = "web search"
 
     return working, stats
 
@@ -2003,6 +2089,7 @@ def process_companies_parallel(
     discover_sites: bool,
     workers: int,
     on_result: Callable[[Company, dict[str, int]], None],
+    on_runtime_error: Callable[[Company, Exception], None] | None = None,
 ) -> None:
     if not companies:
         return
@@ -2016,6 +2103,7 @@ def process_companies_parallel(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         iterator = iter(companies)
         in_flight = set()
+        future_company: dict = {}
 
         def submit_next() -> None:
             while len(in_flight) < workers:
@@ -2025,7 +2113,9 @@ def process_companies_parallel(
                     company = next(iterator)
                 except StopIteration:
                     return
-                in_flight.add(executor.submit(enrich_company_record, company, timeout, discover_sites))
+                future = executor.submit(enrich_company_record, company, timeout, discover_sites)
+                in_flight.add(future)
+                future_company[future] = company
 
         submit_next()
         while in_flight:
@@ -2040,7 +2130,17 @@ def process_companies_parallel(
                 in_flight.discard(future)
                 if future.cancelled():
                     continue
-                on_result(*future.result())
+                company = future_company.pop(future, None)
+                try:
+                    on_result(*future.result())
+                except Exception as exc:
+                    if on_runtime_error is not None and company is not None:
+                        on_runtime_error(company, exc)
+                    # Bei "too many open files" versuchen wir den Datensatz seriell zu retten.
+                    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 24 and company is not None:
+                        on_result(*enrich_company_record(company, timeout=timeout, discover_sites=discover_sites))
+                    elif on_runtime_error is None:
+                        raise
             submit_next()
 
 
@@ -2094,6 +2194,32 @@ def legal_form_matches(filter_value: str | None, company_value: str | None) -> b
     return bool(desired_codes.intersection(company_codes))
 
 
+def legal_form_to_german(value: str | None) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    codes = infer_legal_form_codes(text)
+    if not codes:
+        upper = text.upper()
+        return LEGAL_FORM_DE_MAP.get(upper, value or "")
+    preferred = [
+        "AG",
+        "GMBH",
+        "KOLLEKTIVGESELLSCHAFT",
+        "KOMMANDITGESELLSCHAFT",
+        "ZWEIGNIEDERLASSUNG",
+        "GENOSSENSCHAFT",
+        "EINZELUNTERNEHMEN",
+        "VEREIN",
+        "STIFTUNG",
+    ]
+    for code in preferred:
+        if code in codes:
+            return LEGAL_FORM_DE_MAP.get(code, code)
+    code = sorted(codes)[0]
+    return LEGAL_FORM_DE_MAP.get(code, code)
+
+
 def normalize_canton(value: str | None) -> str:
     normalized = normalize_text(value)
     if not normalized:
@@ -2125,8 +2251,8 @@ def parse_employee_filter(value: str | None) -> tuple[int | None, int | None]:
 def company_key(company: Company) -> str:
     if company.uid:
         return f"uid:{company.uid}"
-    # Verbesserte Deduplizierung: Website/Email-Domain als zusätzlicher Identifier
-    # Dadurch werden Firmen "Immobilia AG" und "Immobilie ABB" nicht vermischt
+    # Die Adresse ist bewusst kein Identitaetsmerkmal, damit Zefix-Daten
+    # in bestehende Alt-Datensaetze gemergt werden koennen.
     website_domain = ""
     if company.website:
         parsed = urlparse(company.website)
@@ -2138,7 +2264,7 @@ def company_key(company: Company) -> str:
     key_parts = [
         f"name:{normalize_text(company.name)}",
         f"city:{normalize_text(company.city)}",
-        f"address:{normalize_text(company.address)}",
+        f"canton:{normalize_canton(company.canton)}",
         f"legal:{normalize_text(company.legal_form)}"
     ]
     if website_domain:
@@ -2243,15 +2369,18 @@ def merge_companies(existing: Company | None, incoming: Company) -> Company:
     if existing is None:
         return incoming
     emails = sorted({*existing.emails, *incoming.emails})
+    incoming_is_zefix = "zefix" in normalize_text(incoming.source)
     return Company(
         name=existing.name or incoming.name,
-        legal_form=existing.legal_form or incoming.legal_form,
+        legal_form=incoming.legal_form if incoming_is_zefix and incoming.legal_form else (existing.legal_form or incoming.legal_form),
         employee_min=existing.employee_min if existing.employee_min is not None else incoming.employee_min,
         employee_max=existing.employee_max if existing.employee_max is not None else incoming.employee_max,
-        city=existing.city or incoming.city,
-        canton=existing.canton or incoming.canton,
-        address=existing.address or incoming.address,
+        city=incoming.city if incoming_is_zefix and incoming.city else (existing.city or incoming.city),
+        canton=incoming.canton if incoming_is_zefix and incoming.canton else (existing.canton or incoming.canton),
+        address=incoming.address if incoming_is_zefix and incoming.address else (existing.address or incoming.address),
+        postal_code=incoming.postal_code if incoming_is_zefix and incoming.postal_code else (existing.postal_code or incoming.postal_code),
         website=existing.website or incoming.website,
+        phone=existing.phone or incoming.phone,
         emails=emails,
         source=merge_source_labels(existing.source, incoming.source),
         uid=existing.uid or incoming.uid,
@@ -2286,6 +2415,7 @@ def sanitize_seed_company(company: Company) -> Company:
 
     company.emails = sanitize_seed_emails(company)
     company.city = sanitize_city_text(company.city)
+    company.phone = normalize_phone(company.phone)
     website = (company.website or "").strip()
     if website:
         parsed = urlparse(website if "://" in website else f"https://{website}")
@@ -2322,6 +2452,8 @@ def company_matches(company: Company, filters: dict[str, str | None]) -> bool:
     legal_form = normalize_text(filters.get("legal_form"))
     city = normalize_text(filters.get("city"))
     address = normalize_text(filters.get("address"))
+    postal_code = normalize_text(filters.get("postal_code"))
+    phone = normalize_text(filters.get("phone"))
     canton = normalize_canton(filters.get("canton"))
     website = normalize_text(filters.get("website"))
     has_email = parse_bool_filter(filters.get("has_email"))
@@ -2335,6 +2467,10 @@ def company_matches(company: Company, filters: dict[str, str | None]) -> bool:
     if city and city not in normalize_text(company.city):
         return False
     if address and address not in normalize_text(company.address):
+        return False
+    if postal_code and postal_code not in normalize_text(company.postal_code):
+        return False
+    if phone and phone not in normalize_text(company.phone):
         return False
     if canton and normalize_canton(company.canton) != canton:
         return False
@@ -2385,7 +2521,9 @@ def load_companies(path: Path) -> list[Company]:
                 city=item.get("city", "").strip(),
                 canton=item.get("canton", "").strip(),
                 address=item.get("address", "").strip(),
+                postal_code=item.get("postal_code", "").strip(),
                 website=item.get("website", "").strip(),
+                phone=normalize_phone(item.get("phone", "")),
                 emails=list(item.get("emails", [])),
                 source=item.get("source", "").strip(),
                 uid=item.get("uid", "").strip(),
@@ -2438,7 +2576,9 @@ def import_csv(path: Path) -> list[Company]:
                 city=pick_field(row, "city", "ort", "gemeinde"),
                 canton=normalize_canton(pick_field(row, "canton", "kanton")),
                 address=pick_field(row, "address", "adresse", "strasse", "street"),
+                postal_code=pick_field(row, "postal_code", "plz", "postleitzahl", "zip"),
                 website=pick_field(row, "website", "url", "webseite"),
+                phone=pick_field(row, "phone", "telefon", "tel", "nummer", "number"),
                 source=pick_field(row, "source", "quelle"),
                 uid=pick_field(row, "uid", "uidnr", "identifier"),
             )
@@ -2464,6 +2604,43 @@ def extract_emails_from_text(text: str) -> list[str]:
         normalized = normalize_obfuscated_email(token)
         if EMAIL_RE.fullmatch(normalized.strip()):
             candidates.add(normalized.strip())
+    return sorted(candidates)
+
+
+def normalize_phone(value: str) -> str:
+    raw = (value or "").strip()
+    raw = raw.replace("(0)", "")
+    raw = raw.replace(" ", "").replace("-", "").replace("/", "").replace(".", "")
+    if raw.startswith("0041"):
+        raw = "+41" + raw[4:]
+    if raw.startswith("41"):
+        raw = "+" + raw
+    if raw.startswith("0") and len(raw) >= 10:
+        raw = "+41" + raw[1:]
+    if raw.startswith("+"):
+        digits = "+" + re.sub(r"\D", "", raw[1:])
+    else:
+        digits = re.sub(r"\D", "", raw)
+    if digits.startswith("+"):
+        body = digits[1:]
+        if len(body) < 9 or len(body) > 12:
+            return ""
+        return digits
+    if len(digits) < 9 or len(digits) > 12:
+        return ""
+    return digits
+
+
+def extract_phones_from_text(text: str) -> list[str]:
+    candidates: set[str] = set()
+    for match in TEL_RE.finditer(text):
+        phone = normalize_phone(match.group(1).split("?")[0])
+        if phone:
+            candidates.add(phone)
+    for match in PHONE_RE.finditer(text):
+        phone = normalize_phone(match.group(0))
+        if phone:
+            candidates.add(phone)
     return sorted(candidates)
 
 
@@ -2596,31 +2773,40 @@ def discover_localch_emails(company: Company, timeout: int = 12) -> list[str]:
     return []
 
 
-def discover_company_emails_via_search(company: Company, timeout: int = 12) -> list[str]:
+def discover_company_contacts_via_search(company: Company, timeout: int = 12) -> tuple[list[str], list[str], str]:
     global SEARCH_DISCOVERY_DISABLED
     if job_should_stop():
-        return []
+        return [], [], ""
 
     search_name = company_search_name(company)
     full_name = normalize_text(company.name)
     city = company.city.strip()
+    location = company_location_hint(company)
     query_variants = [
-        f'"{full_name}" "{city}" kontakt email' if city else f'"{full_name}" kontakt email',
+        f'"{full_name}" "{location}" kontakt email' if location else f'"{full_name}" kontakt email',
         f'"{full_name}" impressum email',
+        f'"{full_name}" "{location}" google maps' if location else f'"{full_name}" google maps',
+        f'"{full_name}" "{location}" telefon' if location else f'"{full_name}" telefon',
         f'"{search_name}" email',
         f'"{search_name}" kontakt email',
+        f'"{search_name}" "{location}" email' if location else f'"{search_name}" email',
+        f'"{search_name}" "{location}" kontakt email' if location else f'"{search_name}" kontakt email',
         f'"{search_name}" {city} kontakt email' if city else f'"{search_name}" kontakt email',
+        f'"{search_name}" "{location}" website telefon' if location else f'"{search_name}" website telefon',
     ]
     providers = [
-        ("ddg", DDG_SEARCH_URL, r'class="result__a" href="([^"]+)"'),
-        ("bing", BING_SEARCH_URL, r'<li class="b_algo".*?<a[^>]*href="([^"]+)"'),
+        ("ddg", DDG_SEARCH_URL, r'class="result__a" href="([^"]+)"', decode_ddg_url),
+        ("bing", BING_SEARCH_URL, r'<li class="b_algo".*?<a[^>]*href="([^"]+)"', decode_bing_url),
+        ("google", GOOGLE_SEARCH_URL, r'href="(/url\?[^\"]+)"', decode_google_url),
     ]
 
     emails: set[str] = set()
+    phones: set[str] = set()
+    discovered_website = ""
     candidate_urls: list[str] = []
     with ThreadPoolExecutor(max_workers=min(3, len(providers) * len(query_variants))) as executor:
         future_map = {}
-        for provider, search_url, pattern in providers:
+        for provider, search_url, pattern, _ in providers:
             if provider == "ddg" and SEARCH_DISCOVERY_DISABLED:
                 continue
             for query in query_variants:
@@ -2641,7 +2827,12 @@ def discover_company_emails_via_search(company: Company, timeout: int = 12) -> l
             if not page_text or not pattern:
                 continue
             for raw_url in re.findall(pattern, page_text, flags=re.S):
-                candidate = decode_ddg_url(raw_url.replace("&amp;", "&")) if provider == "ddg" else decode_bing_url(raw_url)
+                if provider == "ddg":
+                    candidate = decode_ddg_url(raw_url.replace("&amp;", "&"))
+                elif provider == "bing":
+                    candidate = decode_bing_url(raw_url)
+                else:
+                    candidate = decode_google_url(raw_url)
                 if candidate not in candidate_urls:
                     candidate_urls.append(candidate)
             if len(candidate_urls) >= 6:
@@ -2653,44 +2844,95 @@ def discover_company_emails_via_search(company: Company, timeout: int = 12) -> l
     candidate_urls.sort(key=priority_score, reverse=True)
     top_candidates = candidate_urls[:6]
 
-    def fetch_candidate_emails(candidate: str) -> list[str]:
+    def fetch_candidate_contacts(candidate: str) -> tuple[list[str], list[str], str]:
         try:
             page_text, final_url = fetch_html(candidate, timeout=timeout)
         except Exception:
-            return []
+            return [], [], ""
         if not page_text:
-            return []
+            return [], [], ""
         target_url = final_url or candidate
-        if not website_looks_like_company_site(company, target_url, page_text=page_text):
-            return []
+        parsed = urlparse(target_url if "://" in target_url else f"https://{target_url}")
+        host = host_without_port(parsed.netloc)
+        is_maps = "google." in host and "/maps" in parsed.path
+        if not website_looks_like_company_site(company, target_url, page_text=page_text) and not is_maps:
+            return [], [], ""
+
+        contact_phones = extract_phones_from_text(page_text)
+        if is_maps:
+            urls = [decode_google_url(url) for url in re.findall(r'href="(/url\?[^\"]+)"', page_text)]
+            for url in urls:
+                p = urlparse(url)
+                h = host_without_port(p.netloc)
+                if h and not any(blocked in h for blocked in SEARCH_BLOCKLIST) and not is_blocked_foreign_domain(h):
+                    if website_looks_like_company_site(company, url, page_text=page_text):
+                        return [], contact_phones, url
+            return [], contact_phones, ""
+
         parsed = urlparse(target_url if "://" in target_url else f"https://{target_url}")
         host = host_without_port(parsed.netloc)
         if host_tld(host) != "ch":
             host_blob = re.sub(r"[^a-z0-9]+", "", host)
             if not any(token in host_blob for token in company_name_tokens(company.name)):
-                return []
-        return double_validate_company_emails(company, target_url, extract_emails_from_text(page_text), page_text=page_text)
+                return [], [], ""
+        valid_emails = double_validate_company_emails(company, target_url, extract_emails_from_text(page_text), page_text=page_text)
+        return valid_emails, contact_phones, target_url
 
     if top_candidates:
         with ThreadPoolExecutor(max_workers=min(4, len(top_candidates))) as executor:
-            futures = [executor.submit(fetch_candidate_emails, candidate) for candidate in top_candidates]
+            futures = [executor.submit(fetch_candidate_contacts, candidate) for candidate in top_candidates]
             for future in as_completed(futures):
                 if job_should_stop():
                     break
                 try:
-                    result = future.result()
+                    result_emails, result_phones, result_website = future.result()
                 except Exception:
                     continue
-                if not result:
-                    continue
-                emails.update(result)
-                if len(emails) >= 2:
+                if result_emails:
+                    emails.update(result_emails)
+                if result_phones:
+                    phones.update(result_phones)
+                if not discovered_website and result_website:
+                    discovered_website = result_website
+                if len(emails) >= 2 and discovered_website:
                     for pending in futures:
                         if not pending.done():
                             pending.cancel()
                     break
 
-    return sorted(emails)
+    if location and not job_should_stop():
+        source_queries = [
+            LOCALCH_SEARCH_URL.format(query=quote_plus(search_name), where=quote_plus(location)),
+            TEL_SEARCHCH_SEED_URL.format(term=quote_plus(search_name), where=quote_plus(location)),
+        ]
+        for source_url in source_queries:
+            page_text = safe_get_text(source_url, timeout=max(5, min(timeout, 8)), retries=1, tolerate_statuses={403, 429})
+            if not page_text:
+                continue
+            if not page_mentions_company_and_city(company, page_text):
+                continue
+            source_phones = extract_phones_from_text(page_text)
+            if source_phones:
+                phones.update(source_phones)
+            if discovered_website:
+                continue
+            for website_match in re.findall(r'https?://[^\s"\'<>]+', page_text):
+                parsed = urlparse(website_match)
+                host = host_without_port(parsed.netloc)
+                if not host or any(blocked in host for blocked in SEARCH_BLOCKLIST):
+                    continue
+                if is_blocked_foreign_domain(host):
+                    continue
+                if website_looks_like_company_site(company, website_match, page_text=page_text):
+                    discovered_website = website_match
+                    break
+
+    return sorted(emails), sorted(phones), discovered_website
+
+
+def discover_company_emails_via_search(company: Company, timeout: int = 12) -> list[str]:
+    emails, _, _ = discover_company_contacts_via_search(company, timeout=timeout)
+    return emails
 
 
 def crawl_public_emails(
@@ -2825,26 +3067,58 @@ def render_export_rows(companies: list[Company]) -> list[list[str]]:
             rows.append(
                 [
                     export_row["name"],
-                    export_row["legal_form"],
-                    export_row["employee_label"],
-                    export_row["city"],
-                    export_row["canton"],
+                    export_row["legal_form_de"],
                     export_row["address"],
+                    export_row["postal_code"],
+                    export_row["city"],
                     export_row["website"],
+                    export_row["phone"],
                     export_row["emails"],
-                    export_row["source"],
-                    export_row["uid"],
                 ]
             )
     return rows
 
 
-def export_csv_text(companies: list[Company]) -> str:
-    headers = ["name", "legal_form", "employees", "city", "canton", "address", "website", "emails", "source", "uid"]
+def export_headers(profile: str = "compact") -> list[str]:
+    compact = ["firmaname", "rechtsform_de", "adresse", "plz", "ort", "website", "nummer", "email"]
+    if profile == "full":
+        return compact + ["rechtsform_raw", "kanton", "mitarbeiter", "quelle", "uid"]
+    return compact
+
+
+def render_export_rows_with_profile(companies: list[Company], profile: str = "compact") -> list[list[str]]:
+    base_rows = render_export_rows(companies)
+    if profile != "full":
+        return base_rows
+    out: list[list[str]] = []
+    for company in companies:
+        for export_row in company_to_export_rows(company):
+            out.append(
+                [
+                    export_row["name"],
+                    export_row["legal_form_de"],
+                    export_row["address"],
+                    export_row["postal_code"],
+                    export_row["city"],
+                    export_row["website"],
+                    export_row["phone"],
+                    export_row["emails"],
+                    export_row["legal_form"],
+                    export_row["canton"],
+                    export_row["employee_label"],
+                    export_row["source"],
+                    export_row["uid"],
+                ]
+            )
+    return out
+
+
+def export_csv_text(companies: list[Company], profile: str = "compact") -> str:
+    headers = export_headers(profile)
     buffer = tempfile.SpooledTemporaryFile(mode="w+", encoding="utf-8", newline="")
-    writer = csv.writer(buffer)
+    writer = csv.writer(buffer, delimiter=";")
     writer.writerow(headers)
-    for row in render_export_rows(companies):
+    for row in render_export_rows_with_profile(companies, profile=profile):
         writer.writerow(row)
     buffer.seek(0)
     return buffer.read()
@@ -2864,9 +3138,9 @@ def column_name(index: int) -> str:
     return name
 
 
-def build_xlsx_bytes(companies: list[Company]) -> bytes:
-    headers = ["name", "legal_form", "employees", "city", "canton", "address", "website", "emails", "source", "uid"]
-    rows = [headers] + render_export_rows(companies)
+def build_xlsx_bytes(companies: list[Company], profile: str = "compact") -> bytes:
+    headers = export_headers(profile)
+    rows = [headers] + render_export_rows_with_profile(companies, profile=profile)
 
     sheet_rows = []
     for row_index, row in enumerate(rows, start=1):
@@ -2921,18 +3195,18 @@ def build_xlsx_bytes(companies: list[Company]) -> bytes:
 
 
 def format_table(rows: list[Company]) -> str:
-    headers = ["Name", "Rechtsform", "Mitarbeiter", "Ort", "Kanton", "Adresse", "Website", "Emails"]
+    headers = ["Name", "Rechtsform (DE)", "Adresse", "PLZ", "Ort", "Website", "Nummer", "Email"]
     columns = [headers[:]]
     for company in rows:
         columns.append(
             [
                 company.name,
-                company.legal_form,
-                company.employee_label,
-                company.city,
-                company.canton,
+                legal_form_to_german(company.legal_form),
                 company.address,
+                company.postal_code,
+                company.city,
                 company.website,
+                company.phone,
                 ", ".join(company.emails),
             ]
         )
@@ -2960,18 +3234,19 @@ def html_page(
     rows = []
     for company in companies:
         email_html = ", ".join(html.escape(email) for email in company.emails) or "-"
+        phone_html = html.escape(company.phone) if company.phone else "-"
         website_html = html.escape(company.website) if company.website else "-"
         if company.website:
             website_html = f'<a href="{html.escape(company.website)}" target="_blank" rel="noreferrer">{html.escape(company.website)}</a>'
         rows.append(
             "<tr>"
             f"<td>{html.escape(company.name)}</td>"
-            f"<td>{html.escape(company.legal_form)}</td>"
-            f"<td>{html.escape(company.employee_label)}</td>"
-            f"<td>{html.escape(company.city)}</td>"
-            f"<td>{html.escape(company.canton)}</td>"
+            f"<td>{html.escape(legal_form_to_german(company.legal_form))}</td>"
             f"<td>{html.escape(company.address)}</td>"
+            f"<td>{html.escape(company.postal_code)}</td>"
+            f"<td>{html.escape(company.city)}</td>"
             f"<td>{website_html}</td>"
+            f"<td>{phone_html}</td>"
             f"<td>{email_html}</td>"
             "</tr>"
         )
@@ -3167,7 +3442,10 @@ def html_page(
       <input name="name" placeholder="Firmenname" value="{value('name')}" />
       <input name="city" placeholder="Ort" value="{value('city')}" />
             <input name="address" placeholder="Adresse" value="{value('address')}" />
+    <input name="postal_code" placeholder="PLZ" value="{value('postal_code')}" />
+    <input name="phone" placeholder="Nummer" value="{value('phone')}" />
       <input name="canton" placeholder="Kanton z.B. ZH" value="{value('canton')}" />
+    <input name="profile" placeholder="Exportprofil compact/full" value="{value('profile', 'compact')}" />
       <input name="legal_form" placeholder="Rechtsform" value="{value('legal_form')}" />
     <input name="employees" placeholder="Mitarbeiter z.B. 10+ oder 50-200" value="{value('employees')}" />
       <input name="has_email" placeholder="Email ja/nein" value="{value('has_email')}" />
@@ -3179,7 +3457,7 @@ def html_page(
     export_query = f"?{urlencode(export_params)}" if export_params else ""
     table_rows = "".join(rows) if rows else '<tr><td colspan="8">Keine Treffer</td></tr>'
     seed_source_options = "".join(
-        f'<label><input type="checkbox" class="seed-source" value="{html.escape(source)}" checked /> {html.escape(label)}</label>'
+        f'<label><input type="checkbox" class="seed-source" value="{html.escape(source)}"{" checked" if source in DEFAULT_SEED_SOURCES else ""} /> {html.escape(label)}</label>'
         for source, label in SEED_SOURCE_LABELS.items()
     )
 
@@ -3220,17 +3498,35 @@ def html_page(
                 </div>
                 <div class="field">
                     <label for="workers">Parallele Worker</label>
-                    <input id="workers" type="number" min="1" value="1000" />
+                    <input id="workers" type="number" min="1" value="2" />
                 </div>
                 <div class="field">
                     <label for="timeout">Timeout pro Request (Sek.)</label>
                     <input id="timeout" type="number" min="3" value="10" />
                 </div>
                 <div class="field">
+                    <label for="persistEvery">Speichern alle N</label>
+                    <input id="persistEvery" type="number" min="5" value="50" />
+                </div>
+                <div class="field">
                     <label for="discover">Website-Suche</label>
                     <select id="discover">
                         <option value="1">Website-Suche an</option>
                         <option value="0">Website-Suche aus</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="resetContacts">Kontakte vor Lauf löschen</label>
+                    <select id="resetContacts">
+                        <option value="1">Ja</option>
+                        <option value="0" selected>Nein</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label for="autoscale">Worker Autoscale</label>
+                    <select id="autoscale">
+                        <option value="1" selected>An</option>
+                        <option value="0">Aus</option>
                     </select>
                 </div>
                 <div class="field field-wide">
@@ -3262,7 +3558,7 @@ def html_page(
     <div class="tablewrap">
       <table>
                 <thead>
-                    <tr><th>Name</th><th>Rechtsform</th><th>Mitarbeiter</th><th>Ort</th><th>Kanton</th><th>Adresse</th><th>Website</th><th>Emails</th></tr>
+                    <tr><th>Name</th><th>Rechtsform (DE)</th><th>Adresse</th><th>PLZ</th><th>Ort</th><th>Website</th><th>Nummer</th><th>Email</th></tr>
                 </thead>
         <tbody>{table_rows}</tbody>
       </table>
@@ -3276,7 +3572,10 @@ def html_page(
       emailScan: document.getElementById('emailScan'),
             workers: document.getElementById('workers'),
       timeout: document.getElementById('timeout'),
+        persistEvery: document.getElementById('persistEvery'),
             discover: document.getElementById('discover'),
+        resetContacts: document.getElementById('resetContacts'),
+        autoscale: document.getElementById('autoscale'),
             seedSources: Array.from(document.querySelectorAll('input.seed-source'))
     }};
 
@@ -3349,9 +3648,12 @@ def html_page(
         payload.set('email_scan', controls.emailScan.value || '800');
       }}
       
-                        payload.set('workers', controls.workers.value || '1000');
+                        payload.set('workers', controls.workers.value || '2');
       payload.set('timeout', controls.timeout.value || '10');
       payload.set('discover', controls.discover.value || '1');
+    payload.set('persist_every', controls.persistEvery.value || '50');
+    payload.set('reset_contacts', controls.resetContacts.value || '0');
+    payload.set('disable_worker_autoscale', controls.autoscale.value === '0' ? '1' : '0');
             const selectedSeedSources = controls.seedSources.filter((item) => item.checked).map((item) => item.value);
             if ((action === 'seed' || action === 'bootstrap' || action === 'unlimited') && selectedSeedSources.length === 0) {{
                 alert('Bitte mindestens eine Seed-Quelle auswaehlen.');
@@ -3544,10 +3846,13 @@ class KMURequestHandler(BaseHTTPRequestHandler):
             if parsed.path in {"/export.csv", "/export.xlsx"}:
                 params = self._query_params(parsed.query)
                 companies = self._filtered_companies(params)
+                profile = normalize_text(params.get("profile")) or "compact"
+                if profile not in {"compact", "full"}:
+                    profile = "compact"
                 if parsed.path == "/export.csv":
-                    self._send(export_csv_text(companies), content_type="text/csv; charset=utf-8")
+                    self._send(export_csv_text(companies, profile=profile), content_type="text/csv; charset=utf-8")
                 else:
-                    xlsx_bytes = build_xlsx_bytes(companies)
+                    xlsx_bytes = build_xlsx_bytes(companies, profile=profile)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                     self.send_header("Content-Length", str(len(xlsx_bytes)))
@@ -3586,6 +3891,9 @@ class KMURequestHandler(BaseHTTPRequestHandler):
             workers = self._to_int(payload, "workers", DEFAULT_WORKERS, min_value=1)
             timeout = self._to_int(payload, "timeout", 10, min_value=3)
             discover = self._to_bool(payload, "discover", True)
+            reset_contacts = self._to_bool(payload, "reset_contacts", False)
+            persist_every = self._to_int(payload, "persist_every", 50, min_value=5)
+            disable_worker_autoscale = self._to_bool(payload, "disable_worker_autoscale", False)
             if "seed_sources" in payload:
                 seed_sources = parse_seed_sources(payload.get("seed_sources"), default_on_empty=False)
                 if not seed_sources:
@@ -3612,6 +3920,9 @@ class KMURequestHandler(BaseHTTPRequestHandler):
                     timeout=timeout,
                     discover_websites=discover,
                     workers=workers,
+                    reset_contacts=reset_contacts,
+                    persist_every=persist_every,
+                    disable_worker_autoscale=disable_worker_autoscale,
                 )
                 command_enrich(args)
 
@@ -3624,6 +3935,9 @@ class KMURequestHandler(BaseHTTPRequestHandler):
                     timeout=timeout,
                     discover_websites=discover,
                     workers=workers,
+                    persist_every=persist_every,
+                    disable_worker_autoscale=disable_worker_autoscale,
+                    reset_contacts=reset_contacts,
                     seed_sources=seed_sources,
                 )
                 command_bootstrap(args)
@@ -3667,6 +3981,9 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--email-scan", type=int, default=800, help="Wie viele Firmen für E-Mail-Crawling prüfen")
     bootstrap_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Anzahl paralleler Worker")
     bootstrap_parser.add_argument("--timeout", type=int, default=10)
+    bootstrap_parser.add_argument("--persist-every", type=int, default=50, help="Speichere alle N verarbeiteten Firmen")
+    bootstrap_parser.add_argument("--disable-worker-autoscale", action="store_true", help="Adaptive Worker-Erhoehung deaktivieren")
+    bootstrap_parser.add_argument("--reset-contacts", action="store_true", help="Bestehende Website/E-Mail vor dem Scan leeren")
     bootstrap_parser.add_argument(
         "--seed-sources",
         default=",".join(DEFAULT_SEED_SOURCES),
@@ -3685,6 +4002,8 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--employees", default="")
     search_parser.add_argument("--city", default="")
     search_parser.add_argument("--address", default="")
+    search_parser.add_argument("--postal-code", default="")
+    search_parser.add_argument("--phone", default="")
     search_parser.add_argument("--canton", default="")
     search_parser.add_argument("--website", default="")
     search_parser.add_argument("--has-email", default="")
@@ -3695,6 +4014,9 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Anzahl paralleler Worker")
     enrich_parser.add_argument("--timeout", type=int, default=10)
     enrich_parser.add_argument("--discover-websites", action="store_true", help="Vor dem Crawling nach Webseiten suchen")
+    enrich_parser.add_argument("--reset-contacts", action="store_true", help="Bestehende Website/E-Mail vor Enrich leeren")
+    enrich_parser.add_argument("--persist-every", type=int, default=50, help="Speichere alle N verarbeiteten Firmen")
+    enrich_parser.add_argument("--disable-worker-autoscale", action="store_true", help="Adaptive Worker-Erhoehung deaktivieren")
     enrich_parser.add_argument("--out", default=None, help="Ausgabedatei für angereicherte Daten")
 
     export_parser = subparsers.add_parser("export", help="Firmen nach CSV oder XLSX exportieren")
@@ -3705,10 +4027,13 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--employees", default="")
     export_parser.add_argument("--city", default="")
     export_parser.add_argument("--address", default="")
+    export_parser.add_argument("--postal-code", default="")
+    export_parser.add_argument("--phone", default="")
     export_parser.add_argument("--canton", default="")
     export_parser.add_argument("--website", default="")
     export_parser.add_argument("--has-email", default="")
     export_parser.add_argument("--has-website", default="")
+    export_parser.add_argument("--profile", choices=("compact", "full"), default="compact")
 
     serve_parser = subparsers.add_parser("serve", help="Weboberfläche starten")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -3793,7 +4118,19 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         stored_companies[key] = merge_companies(existing, company) if existing is not None else company
     # Seeds sofort sichern, damit ein späterer E-Mail-Scan auf dem vorhandenen Bestand weiterarbeiten kann.
     save_companies(destination, stored_companies.values())
-    workers = resolve_worker_count(getattr(args, "workers", None))
+    requested_workers = getattr(args, "workers", None)
+    workers = resolve_worker_count(requested_workers)
+    adaptive_workers = requested_workers is None and not getattr(args, "disable_worker_autoscale", False)
+    worker_ceiling = max(1, min(4, MAX_INTERNAL_WORKERS))
+    persist_every = max(5, int(getattr(args, "persist_every", 50)))
+
+    if getattr(args, "reset_contacts", False):
+        for key, company in list(stored_companies.items()):
+            cleaned = clone_company(company)
+            cleaned.website = ""
+            cleaned.emails = []
+            stored_companies[key] = cleaned
+        save_companies(destination, stored_companies.values())
 
     def persist() -> None:
         save_companies(destination, stored_companies.values())
@@ -3820,7 +4157,7 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         print(f"Starte E-Mail-Anreicherung für {len(pending)} Firmen mit {workers} parallelen Prozessen...")
 
         processed_since_persist = 0
-        persist_every = 25
+        runtime_errors = 0
 
         def handle_result(working: Company, stats: dict[str, int]) -> None:
             nonlocal processed_since_persist
@@ -3842,20 +4179,56 @@ def command_bootstrap(args: argparse.Namespace) -> int:
                 processed_since_persist = 0
             print(f"  Fortschritt: {make_job_summary()}")
 
-        process_companies_parallel(
-            pending,
-            timeout=args.timeout,
-            discover_sites=args.discover_websites,
-            workers=workers,
-            on_result=handle_result,
-        )
+        def handle_runtime_error(_company: Company, _exc: Exception) -> None:
+            nonlocal runtime_errors, workers
+            runtime_errors += 1
+            if isinstance(_exc, OSError) and getattr(_exc, "errno", None) == 24:
+                workers = 1
+                job_update(last_message="Datei-Limit erreicht, falle auf 1 Worker zurück")
+
+        if adaptive_workers and workers < worker_ceiling and len(pending) >= 200:
+            split = max(100, min(500, len(pending) // 4))
+            cursor = 0
+            while cursor < len(pending):
+                chunk = pending[cursor : cursor + split]
+                process_companies_parallel(
+                    chunk,
+                    timeout=args.timeout,
+                    discover_sites=args.discover_websites,
+                    workers=workers,
+                    on_result=handle_result,
+                    on_runtime_error=handle_runtime_error,
+                )
+                if runtime_errors == 0 and workers < worker_ceiling:
+                    workers += 1
+                    job_update(last_message=f"Worker automatisch auf {workers} erhöht")
+                cursor += split
+        else:
+            process_companies_parallel(
+                pending,
+                timeout=args.timeout,
+                discover_sites=args.discover_websites,
+                workers=workers,
+                on_result=handle_result,
+                on_runtime_error=handle_runtime_error,
+            )
+        if processed_since_persist > 0:
+            persist()
         persist()
 
     persist()
     with_emails = sum(1 for company in stored_companies.values() if company.emails)
     with_websites = sum(1 for company in stored_companies.values() if company.website)
+    report = quality_report(list(stored_companies.values()))
     print(f"Bootstrap fertig -> {destination}")
     print(f"Mit Website: {with_websites} | Mit E-Mail: {with_emails}")
+    print(
+        "Qualitätsreport: "
+        f"domain_mismatch={report['domain_mismatch']}, "
+        f"duplicate_phone={report['duplicate_phone']}, "
+        f"duplicate_email={report['duplicate_email']}, "
+        f"missing_address_with_website={report['missing_address_with_website']}"
+    )
     return 0
 
 
@@ -3867,6 +4240,8 @@ def command_search(args: argparse.Namespace) -> int:
         "employees": args.employees,
         "city": args.city,
         "address": args.address,
+        "postal_code": args.postal_code,
+        "phone": args.phone,
         "canton": args.canton,
         "website": args.website,
         "has_email": args.has_email,
@@ -3878,13 +4253,110 @@ def command_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def backfill_companies_from_zefix(
+    companies: list[Company],
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> list[Company]:
+    if not companies:
+        return companies
+
+    zefix_limit = max(len(companies), ZEFIX_DEFAULT_LIMIT)
+    zefix_companies = seed_from_zefix(limit=zefix_limit, on_progress=on_progress)
+    zefix_index: dict[str, Company] = {}
+    for zefix_company in zefix_companies:
+        key = company_key(zefix_company)
+        existing = zefix_index.get(key)
+        zefix_index[key] = merge_companies(existing, zefix_company) if existing is not None else zefix_company
+
+    backfilled: list[Company] = []
+    for company in companies:
+        match = zefix_index.get(company_key(company))
+        backfilled.append(merge_companies(company, match) if match is not None else company)
+    return backfilled
+
+
+def reset_company_contacts(companies: list[Company]) -> list[Company]:
+    reset: list[Company] = []
+    for company in companies:
+        cleaned = clone_company(company)
+        cleaned.website = ""
+        cleaned.emails = []
+        reset.append(cleaned)
+    return reset
+
+
+def quality_report(companies: list[Company]) -> dict[str, int]:
+    domain_mismatch = 0
+    duplicate_phone = 0
+    duplicate_email = 0
+    missing_address = 0
+    seen_phones: dict[str, int] = {}
+    seen_emails: dict[str, int] = {}
+
+    for company in companies:
+        if company.website and not company.address:
+            missing_address += 1
+        if company.website and company.emails:
+            host = host_without_port(urlparse(company.website if "://" in company.website else f"https://{company.website}").netloc)
+            allowed = root_domain(host)
+            for email in company.emails:
+                domain = root_domain(email.rsplit("@", 1)[-1])
+                if allowed and domain != allowed:
+                    domain_mismatch += 1
+        phone = normalize_phone(company.phone)
+        if phone:
+            seen_phones[phone] = seen_phones.get(phone, 0) + 1
+        for email in company.emails:
+            norm = normalize_text(email).lower()
+            if norm:
+                seen_emails[norm] = seen_emails.get(norm, 0) + 1
+
+    for count in seen_phones.values():
+        if count > 1:
+            duplicate_phone += count - 1
+    for count in seen_emails.values():
+        if count > 1:
+            duplicate_email += count - 1
+
+    return {
+        "domain_mismatch": domain_mismatch,
+        "duplicate_phone": duplicate_phone,
+        "duplicate_email": duplicate_email,
+        "missing_address_with_website": missing_address,
+    }
+
+
 def command_enrich(args: argparse.Namespace) -> int:
     data_path = Path(args.data)
     target = Path(args.out or data_path)
     companies = load_companies(data_path)
-    workers = resolve_worker_count(getattr(args, "workers", None))
+    requested_workers = getattr(args, "workers", None)
+    workers = resolve_worker_count(requested_workers)
+    adaptive_workers = requested_workers is None and not getattr(args, "disable_worker_autoscale", False)
+    worker_ceiling = max(1, min(4, MAX_INTERNAL_WORKERS))
+    persist_every = max(5, int(getattr(args, "persist_every", 50)))
+
+    if getattr(args, "reset_contacts", False):
+        companies = reset_company_contacts(companies)
+        save_companies(target, companies)
+
     target_count = min(args.limit, len(companies)) if args.limit is not None else len(companies)
-    job_update(phase="enrich", total=target_count, processed=0, accepted=0, websites_found=0, emails_found=0, skipped=0, errors=0, current="Email-Scan startet...")
+    job_update(
+        phase="enrich",
+        total=target_count,
+        processed=0,
+        accepted=0,
+        websites_found=0,
+        emails_found=0,
+        skipped=0,
+        errors=0,
+        current="Zefix-Adressen werden geladen...",
+        last_message="Starte Zefix-Adressabgleich",
+    )
+    companies = backfill_companies_from_zefix(
+        companies,
+        on_progress=lambda processed, total, current: job_update(processed=processed, total=total, current=current, last_message=current),
+    )
     pending = companies[:target_count]
     job_update(
         phase="enrich",
@@ -3900,11 +4372,14 @@ def command_enrich(args: argparse.Namespace) -> int:
     )
 
     stored_companies = {company_key(company): company for company in companies}
+    runtime_errors = 0
+    processed_since_persist = 0
 
     def persist() -> None:
         save_companies(target, stored_companies.values())
 
     def handle_result(working: Company, stats: dict[str, int]) -> None:
+        nonlocal processed_since_persist
         key = company_key(working)
         stored_companies[key] = merge_companies(stored_companies.get(key), working)
         job_increment(
@@ -3917,16 +4392,56 @@ def command_enrich(args: argparse.Namespace) -> int:
         job_increment(accepted=1)
         if not working.emails:
             job_increment(skipped=1)
-        persist()
+        processed_since_persist += 1
+        if processed_since_persist >= persist_every:
+            persist()
+            processed_since_persist = 0
 
-    process_companies_parallel(
-        pending,
-        timeout=args.timeout,
-        discover_sites=args.discover_websites,
-        workers=workers,
-        on_result=handle_result,
-    )
+    def handle_runtime_error(_company: Company, _exc: Exception) -> None:
+        nonlocal runtime_errors, workers
+        runtime_errors += 1
+        if isinstance(_exc, OSError) and getattr(_exc, "errno", None) == 24:
+            workers = 1
+            job_update(last_message="Datei-Limit erreicht, falle auf 1 Worker zurück")
+
+    if adaptive_workers and workers < worker_ceiling and len(pending) >= 200:
+        split = max(100, min(500, len(pending) // 4))
+        cursor = 0
+        while cursor < len(pending):
+            chunk = pending[cursor : cursor + split]
+            process_companies_parallel(
+                chunk,
+                timeout=args.timeout,
+                discover_sites=args.discover_websites,
+                workers=workers,
+                on_result=handle_result,
+                on_runtime_error=handle_runtime_error,
+            )
+            if runtime_errors == 0 and workers < worker_ceiling:
+                workers += 1
+                job_update(last_message=f"Worker automatisch auf {workers} erhöht")
+            cursor += split
+    else:
+        process_companies_parallel(
+            pending,
+            timeout=args.timeout,
+            discover_sites=args.discover_websites,
+            workers=workers,
+            on_result=handle_result,
+            on_runtime_error=handle_runtime_error,
+        )
+
+    if processed_since_persist > 0:
+        persist()
     persist()
+    report = quality_report(list(stored_companies.values()))
+    print(
+        "Qualitätsreport: "
+        f"domain_mismatch={report['domain_mismatch']}, "
+        f"duplicate_phone={report['duplicate_phone']}, "
+        f"duplicate_email={report['duplicate_email']}, "
+        f"missing_address_with_website={report['missing_address_with_website']}"
+    )
     print(f"Angereichert: {len(stored_companies)} Firmen -> {target}")
     return 0
 
@@ -3939,6 +4454,8 @@ def command_export(args: argparse.Namespace) -> int:
         "employees": args.employees,
         "city": args.city,
         "address": args.address,
+        "postal_code": args.postal_code,
+        "phone": args.phone,
         "canton": args.canton,
         "website": args.website,
         "has_email": args.has_email,
@@ -3948,9 +4465,9 @@ def command_export(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if args.format == "csv":
-        out_path.write_text(export_csv_text(matches), encoding="utf-8")
+        out_path.write_text(export_csv_text(matches, profile=args.profile), encoding="utf-8")
     else:
-        out_path.write_bytes(build_xlsx_bytes(matches))
+        out_path.write_bytes(build_xlsx_bytes(matches, profile=args.profile))
     print(f"Exportiert: {len(matches)} Firmen -> {out_path}")
     return 0
 
@@ -3958,8 +4475,8 @@ def command_export(args: argparse.Namespace) -> int:
 def command_serve(args: argparse.Namespace) -> int:
     dataset_path = Path(args.data)
     if not dataset_path.exists():
-        print("Keine Datendatei gefunden, ich lade automatisch einen Multi-Seed (Zefix + search.ch + local.ch).")
-        seed_companies = seed_from_multi_sources(limit=ZEFIX_DEFAULT_LIMIT)
+        print("Keine Datendatei gefunden, ich lade automatisch einen Zefix-Seed.")
+        seed_companies = seed_from_zefix(limit=ZEFIX_DEFAULT_LIMIT)
         save_companies(dataset_path, seed_companies)
         print(f"Seed geladen: {len(seed_companies)} Firmen -> {dataset_path}")
     KMURequestHandler.dataset_path = dataset_path
