@@ -1,0 +1,17 @@
+[Unit]
+Description=KMU Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kmus
+Environment=DATA_FILE=companies.json
+ExecStart=/opt/kmus/.venv/bin/python /opt/kmus/kmu_tool.py serve --data /opt/kmus/companies.json --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

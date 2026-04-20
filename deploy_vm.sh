@@ -1,6 +1,6 @@
 #!/bin/bash
 # Deploy script für GCP VM - Führe dieses Script auf der VM aus
-set -e
+set -euo pipefail
 
 echo "=== VM Fresh Deploy ==="
 echo
@@ -35,6 +35,7 @@ echo
 echo "4. Services neustarten..."
 sudo systemctl restart kmu-worker.service kmu-web.service
 sleep 2
+sudo systemctl status kmu-worker.service --no-pager | head -3
 sudo systemctl status kmu-web.service --no-pager | head -3
 echo "✓ Services gestartet"
 echo
@@ -49,7 +50,9 @@ echo
 echo "=== DEPLOY ERFOLGREICH ==="
 echo
 echo "Website: http://$(curl -s ifconfig.me):8000"
-echo "Status: $(sudo systemctl is-active kmu-web.service)"
+echo "Status Worker: $(sudo systemctl is-active kmu-worker.service)"
+echo "Status Web: $(sudo systemctl is-active kmu-web.service)"
+echo "Hinweis GCP Firewall: TCP 8000 muss erlaubt sein"
 echo
 echo "Nächste Schritte:"
 echo "1. Browser öffnen: http://$(curl -s ifconfig.me):8000"

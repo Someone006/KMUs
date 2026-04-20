@@ -1,0 +1,14 @@
+Zeitraum: 2026-04-13 bis 2026-04-20
+2026-04-13 | user=0 | assistant_events=0 | sessions=0
+2026-04-14 | user=0 | assistant_events=1800 | sessions=600
+2026-04-15 | user=92 | assistant_events=1549 | sessions=412
+  - ich brauche einen system der unternehmen in der schweiz überprüft und dann die emails herausfinden kann. Ixh möchte auch die unternehmen fil
+  - mach einfach was besser ist und alle emails geben kann
+  - mach alle 3. Ich will nicht immer die firmen importieren sondern das system soll schon mindestens 10000 firmen oder mehr haben
+  - Mach alles was besser für meinen projekt ist. Ich will nachher alles filtern können und die emails erhalten. Es soll einfach zu benutzen sei
+  - gerne
+2026-04-16 | user=0 | assistant_events=0 | sessions=0
+2026-04-17 | user=0 | assistant_events=0 | sessions=0
+2026-04-18 | user=0 | assistant_events=0 | sessions=0
+2026-04-19 | user=0 | assistant_events=0 | sessions=0
+2026-04-20 | user=0 | assistant_events=0 | sessions=0
