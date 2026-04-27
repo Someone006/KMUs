@@ -109,7 +109,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-MAX_CRAWL_PAGES = 6
+MAX_CRAWL_PAGES = 12
 MAX_PAGE_BYTES = 1_000_000
 ZEFIX_QUERY_ENDPOINT = "https://lindas.admin.ch/query"
 ZEFIX_PAGE_SIZE = 500
@@ -118,8 +118,8 @@ ZEFIX_MAX_ATTEMPTS_PER_PAGE = 12
 ZEFIX_POST_TIMEOUT_SEC = 45
 ZEFIX_POST_RETRIES = 2
 ZEFIX_BACKFILL_MAX_DURATION_SEC = 900
-DEFAULT_WORKERS = 3
-MAX_INTERNAL_WORKERS = 64
+DEFAULT_WORKERS = 1000
+MAX_INTERNAL_WORKERS = 1000
 DEFAULT_PERSIST_EVERY = 500
 KMU_MIN_EMPLOYEES = 10
 KMU_MAX_EMPLOYEES: int | None = None
@@ -139,7 +139,7 @@ SWISSGUIDE_SEARCH_URL = "https://www.swissguide.ch/suche?query={query}"
 SEED_PAGES_MAX = 4
 VISITED_PAGES_FILE = str(Path(__file__).resolve().with_name("visited_seed_pages.json"))
 SEARCH_DISCOVERY_DISABLED = False
-HTTP_CONCURRENCY_LIMIT = 4
+HTTP_CONCURRENCY_LIMIT = 32
 HTTP_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_CONCURRENCY_LIMIT)
 PERSISTENCE_LOCK = threading.Lock()
 SEARCH_BLOCKLIST = (
@@ -2927,7 +2927,7 @@ def discover_contact_pages(website: str, html_text: str) -> list[str]:
         if link not in candidates:
             candidates.append(link)
     candidates.sort(key=priority_score, reverse=True)
-    return candidates[:10]
+    return candidates[:16]
 
 
 def crawl_contact_pages(
@@ -3079,14 +3079,20 @@ def discover_company_contacts_via_search(company: Company, timeout: int = 12) ->
         f'"{full_name}" impressum email',
         f'"{full_name}" "{address}" kontakt impressum email' if address else f'"{full_name}" kontakt impressum email',
         f'"{full_name}" "{postal}" "{city}" impressum email' if postal and city else f'"{full_name}" impressum email',
+        f'"{full_name}" email',
+        f'"{full_name}" info',
         f'"{full_name}" "{location}" google maps' if location else f'"{full_name}" google maps',
         f'"{full_name}" "{location}" telefon' if location else f'"{full_name}" telefon',
         f'"{search_name}" email',
         f'"{search_name}" kontakt email',
+        f'"{search_name}" info',
+        f'"{search_name}" office',
         f'"{search_name}" "{location}" email' if location else f'"{search_name}" email',
         f'"{search_name}" "{location}" kontakt email' if location else f'"{search_name}" kontakt email',
         f'"{search_name}" {city} kontakt email' if city else f'"{search_name}" kontakt email',
         f'"{search_name}" "{location}" website telefon' if location else f'"{search_name}" website telefon',
+        f'"{search_name}" impressum',
+        f'"{search_name}" support',
     ]
     providers = [
         ("ddg", DDG_SEARCH_URL, r'class="result__a" href="([^"]+)"', decode_ddg_url),
@@ -3129,14 +3135,9 @@ def discover_company_contacts_via_search(company: Company, timeout: int = 12) ->
                     candidate = decode_google_url(raw_url)
                 if candidate not in candidate_urls:
                     candidate_urls.append(candidate)
-            if len(candidate_urls) >= 6:
-                for pending in future_map:
-                    if not pending.done():
-                        pending.cancel()
-                break
 
     candidate_urls.sort(key=priority_score, reverse=True)
-    top_candidates = candidate_urls[:6]
+    top_candidates = candidate_urls[:12]
 
     def is_contact_or_impressum_url(url: str) -> bool:
         lower = url.lower()
@@ -3167,13 +3168,6 @@ def discover_company_contacts_via_search(company: Company, timeout: int = 12) ->
                         return [], contact_phones, url
             return [], contact_phones, ""
 
-        parsed = urlparse(target_url if "://" in target_url else f"https://{target_url}")
-        host = host_without_port(parsed.netloc)
-        if host_tld(host) != "ch":
-            host_blob = re.sub(r"[^a-z0-9]+", "", host)
-            if not any(token in host_blob for token in company_name_tokens(company.name)):
-                return [], [], ""
-
         def email_validator(email: str, source_text: str) -> bool:
             return bool(double_validate_company_emails(company, target_url, [email], page_text=source_text))
 
@@ -3203,11 +3197,6 @@ def discover_company_contacts_via_search(company: Company, timeout: int = 12) ->
                     phones.update(result_phones)
                 if not discovered_website and result_website:
                     discovered_website = result_website
-                if len(emails) >= 2 and discovered_website:
-                    for pending in futures:
-                        if not pending.done():
-                            pending.cancel()
-                    break
 
     if location and not job_should_stop():
         source_queries = [
@@ -3286,14 +3275,14 @@ def crawl_public_emails(
                 emails.add(email)
                 if on_email is not None:
                     on_email(email)
-        if depth >= 1:
+        if depth >= 2:
             continue
         candidates = []
         for link in discover_links(html_text, final_url):
             if same_site(link, root_url):
                 candidates.append(link)
         candidates.sort(key=priority_score, reverse=True)
-        for link in candidates[:4]:
+        for link in candidates[:8]:
             if link not in seen:
                 queue.append((link, depth + 1))
 
@@ -3795,7 +3784,7 @@ def html_page(
                 <div class="stat"><div class="label">Firmen geprüft</div><div class="value" id="statProcessed">{int(status.get('processed', 0))}</div><div class="sub">von <span id="statTotal">{int(status.get('total', 0))}</span></div></div>
                 <div class="stat"><div class="label">Firmen gespeichert</div><div class="value" id="statAccepted">{int(status.get('accepted', 0))}</div><div class="sub">KMU mit geprüfter E-Mail</div></div>
                 <div class="stat"><div class="label">Websites verifiziert</div><div class="value" id="statWebsites">{int(status.get('websites_found', 0))}</div><div class="sub">passende Firmen-Websites</div></div>
-                <div class="stat"><div class="label">E-Mails verifiziert</div><div class="value" id="statEmails">{int(status.get('emails_found', 0))}</div><div class="sub">nur passende Domains</div></div>
+                <div class="stat"><div class="label">E-Mails verifiziert</div><div class="value" id="statEmails">{int(status.get('emails_found', 0))}</div><div class="sub">maximale Treffer</div></div>
             </div>
     </section>
 
@@ -3808,7 +3797,7 @@ def html_page(
                 </div>
                 <div class="field">
                     <label for="emailScan">Email-Scan (Anzahl)</label>
-                    <input id="emailScan" type="number" min="0" value="800" />
+                    <input id="emailScan" type="number" min="0" value="1000000000" />
                 </div>
                 <div class="field">
                     <label for="workers">Parallele Worker</label>
@@ -3959,7 +3948,7 @@ def html_page(
                 payload.set('email_scan', '1000000000');
       }} else {{
         payload.set('limit', controls.limit.value || '10000');
-        payload.set('email_scan', controls.emailScan.value || '800');
+        payload.set('email_scan', controls.emailScan.value || '1000000000');
       }}
       
                         payload.set('workers', controls.workers.value || '{worker_default}');
@@ -4235,7 +4224,7 @@ class KMURequestHandler(BaseHTTPRequestHandler):
                 return
             payload = self._post_params()
             limit = self._to_int(payload, "limit", ZEFIX_DEFAULT_LIMIT, min_value=1)
-            email_scan = self._to_int(payload, "email_scan", 800, min_value=0)
+            email_scan = self._to_int(payload, "email_scan", 1000000000, min_value=0)
             start_index = self._to_int(payload, "start_index", 0, min_value=0)
             workers = self._to_int(payload, "workers", DEFAULT_WORKERS, min_value=1)
             timeout = self._to_int(payload, "timeout", 10, min_value=3)
@@ -4475,7 +4464,7 @@ def command_bootstrap(args: argparse.Namespace) -> int:
     requested_workers = getattr(args, "workers", None)
     workers = resolve_worker_count(requested_workers)
     adaptive_workers = requested_workers is None and not getattr(args, "disable_worker_autoscale", False)
-    worker_ceiling = max(1, min(4, MAX_INTERNAL_WORKERS))
+    worker_ceiling = max(1, MAX_INTERNAL_WORKERS)
     persist_every = max(20, int(getattr(args, "persist_every", DEFAULT_PERSIST_EVERY)))
 
     if getattr(args, "reset_contacts", False):
@@ -4761,7 +4750,7 @@ def command_enrich(args: argparse.Namespace) -> int:
     requested_workers = getattr(args, "workers", None)
     workers = resolve_worker_count(requested_workers)
     adaptive_workers = requested_workers is None and not getattr(args, "disable_worker_autoscale", False)
-    worker_ceiling = max(1, min(4, MAX_INTERNAL_WORKERS))
+    worker_ceiling = max(1, MAX_INTERNAL_WORKERS)
     persist_every = max(20, int(getattr(args, "persist_every", DEFAULT_PERSIST_EVERY)))
 
     if getattr(args, "reset_contacts", False):
