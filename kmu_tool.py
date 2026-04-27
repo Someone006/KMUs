@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import gc
 import html
 import json
 import os
@@ -89,8 +90,25 @@ CANTON_ALIASES = {
     "zürich": "ZH",
     "zurich": "ZH",
 }
-KEYWORD_HINTS = ("kontakt", "contact", "impressum", "imprint", "about", "unternehmen", "company", "team")
-USER_AGENT = "KMU-Mail-Finder/1.0"
+KEYWORD_HINTS = (
+    "kontakt",
+    "contact",
+    "impressum",
+    "imprint",
+    "media",
+    "medien",
+    "press",
+    "presse",
+    "about",
+    "unternehmen",
+    "company",
+    "team",
+)
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 MAX_CRAWL_PAGES = 6
 MAX_PAGE_BYTES = 1_000_000
 ZEFIX_QUERY_ENDPOINT = "https://lindas.admin.ch/query"
@@ -100,9 +118,9 @@ ZEFIX_MAX_ATTEMPTS_PER_PAGE = 12
 ZEFIX_POST_TIMEOUT_SEC = 45
 ZEFIX_POST_RETRIES = 2
 ZEFIX_BACKFILL_MAX_DURATION_SEC = 900
-DEFAULT_WORKERS = 4
+DEFAULT_WORKERS = 3
 MAX_INTERNAL_WORKERS = 64
-DEFAULT_PERSIST_EVERY = 200
+DEFAULT_PERSIST_EVERY = 500
 KMU_MIN_EMPLOYEES = 10
 KMU_MAX_EMPLOYEES: int | None = None
 BFS_SNAPSHOT_URL = "https://www.agvchapp.bfs.admin.ch/api/communes/snapshot?date={date}"
@@ -121,8 +139,9 @@ SWISSGUIDE_SEARCH_URL = "https://www.swissguide.ch/suche?query={query}"
 SEED_PAGES_MAX = 4
 VISITED_PAGES_FILE = str(Path(__file__).resolve().with_name("visited_seed_pages.json"))
 SEARCH_DISCOVERY_DISABLED = False
-HTTP_CONCURRENCY_LIMIT = 48
+HTTP_CONCURRENCY_LIMIT = 4
 HTTP_REQUEST_SEMAPHORE = threading.BoundedSemaphore(HTTP_CONCURRENCY_LIMIT)
+PERSISTENCE_LOCK = threading.Lock()
 SEARCH_BLOCKLIST = (
     "duckduckgo.com",
     "zefix.admin.ch",
@@ -467,7 +486,7 @@ def resolve_worker_count(requested_workers: int | None, default_workers: int = D
     except Exception:
         fd_soft_limit = 1024
     # Reserviert FD-Budget für Server, Logs und Datei-IO.
-    fd_safe_cap = max(1, min(MAX_INTERNAL_WORKERS, int(fd_soft_limit // 24)))
+    fd_safe_cap = max(1, min(MAX_INTERNAL_WORKERS, int(fd_soft_limit // 64)))
 
     if requested_workers is not None and requested_workers > 0:
         return max(1, min(requested_workers, fd_safe_cap))
@@ -525,8 +544,9 @@ def safe_get_text(
 ) -> str:
     headers = {"User-Agent": USER_AGENT}
     last_error: Exception | None = None
+    current_url = url
     for attempt in range(1, retries + 1):
-        request = Request(url, headers=headers)
+        request = Request(current_url, headers=headers)
         try:
             with HTTP_REQUEST_SEMAPHORE:
                 with urlopen(request, timeout=timeout) as response:
@@ -535,6 +555,17 @@ def safe_get_text(
             last_error = exc
             if tolerate_statuses and exc.code in tolerate_statuses:
                 return ""
+            # Python 3.10 follows many redirects automatically, but 308 may still bubble up.
+            if exc.code in {301, 302, 303, 307, 308}:
+                location = exc.headers.get("Location")
+                if location:
+                    redirected_url = urljoin(current_url, location)
+                    return safe_get_text(
+                        redirected_url,
+                        timeout=timeout,
+                        retries=max(1, retries - attempt + 1),
+                        tolerate_statuses=tolerate_statuses,
+                    )
             if exc.code not in {429, 500, 502, 503, 504} or attempt == retries:
                 raise
         except (URLError, TimeoutError, ssl.SSLError) as exc:
@@ -660,8 +691,9 @@ def save_visited_pages(visited: dict[str, set[str]]) -> None:
     """Speichert die Datei mit besuchten Suchbegriffen."""
     try:
         data = {k: sorted(list(v)) for k, v in visited.items()}
-        with open(VISITED_PAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with PERSISTENCE_LOCK:
+            with open(VISITED_PAGES_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
     except IOError as e:
         print(f"Warnung: visited_pages nicht gespeichert: {e}", file=sys.stderr)
 
@@ -1765,6 +1797,47 @@ def company_core_name(company: Company) -> str:
     return short_name if len(short_name) >= 6 else full_name
 
 
+def company_domain_candidates(company: Company) -> list[str]:
+    raw_name = company.name or ""
+    generic_tokens = {
+        "schweiz",
+        "swiss",
+        "suisse",
+        "holding",
+        "group",
+        "company",
+        "services",
+        "solutions",
+    }
+    base_tokens = [token for token in company_name_tokens(raw_name) if len(token) >= 4 and token not in generic_tokens]
+    token_variants: list[str] = []
+    for token in base_tokens:
+        token_variants.append(token)
+        # Häufige Sprach-/Plural-Endungen für Markendomains abbilden (z.B. poste -> post).
+        for suffix in ("e", "es", "s"):
+            if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                token_variants.append(token[: -len(suffix)])
+
+    tokens = []
+    seen_tokens: set[str] = set()
+    for token in token_variants:
+        if token not in seen_tokens:
+            seen_tokens.add(token)
+            tokens.append(token)
+    acronyms = [match.group(0).lower() for match in re.finditer(r"\b[A-Z]{2,5}\b", raw_name)]
+
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for token in [*acronyms, *tokens]:
+        for host in (f"https://{token}.ch", f"https://www.{token}.ch"):
+            if host not in seen:
+                seen.add(host)
+                hosts.append(host)
+        if len(hosts) >= 12:
+            break
+    return hosts
+
+
 def page_mentions_full_company_name(company: Company, page_text: str) -> bool:
     content = normalize_text(page_text)
     if not content:
@@ -1795,31 +1868,40 @@ def page_mentions_company_and_city(company: Company, page_text: str) -> bool:
 
 
 def website_looks_like_company_site(company: Company, website: str, page_text: str = "") -> bool:
+    # SCHNELL-MODUS: Akzeptiere fast alle Website-Kandidaten
     parsed = urlparse(website if "://" in website else f"https://{website}")
     host = host_without_port(parsed.netloc)
     if not host:
         return False
-    if is_blocked_foreign_domain(host):
-        return False
+    
+    # Nur absolute Blockierungen
     if any(blocked in host for blocked in SEARCH_BLOCKLIST):
         return False
+    
     domain = root_domain(host)
     if domain in EMAIL_DOMAIN_BLOCKLIST:
         return False
-    if domain in FREE_EMAIL_DOMAINS:
+    
+    # Akzeptiere .ch Domains und andere legale TLDs
+    tld = host_tld(host)
+    if tld not in {"ch", "com", "org", "net", "de", "at", "fr", "it", "uk", "co", "io", "dev", "app"}:
         return False
+    
+    # Blockiere nur Media/Spam-Indikatoren
+    media_like_tokens = ("zeitung", "nachrichten", "blog", "reddit", "wikipedia", "directory", "listing")
+    host_blob = re.sub(r"[^a-z0-9]+", "", host)
+    if any(token in host_blob for token in media_like_tokens):
+        return False
+    
+    # Akzeptiere .ch fast uneingeschränkt, für andere prüfe Domain-Match
+    if tld == "ch":
+        return True
+    
+    # Für .com/.org etc. prüfe zumindest Token-Match
     token_blob = re.sub(r"[^a-z0-9]+", "", domain)
-    content_match = page_mentions_company_and_city(company, page_text)
-    full_name_match = page_mentions_full_company_name(company, page_text)
     domain_token_match = any(token in token_blob or token_blob in token for token in company_name_tokens(company.name))
-
-    # Hohe Präzision: Domain-Hinweis allein reicht nicht, es braucht zusätzlich Inhalts-Match.
-    if domain_token_match and content_match:
-        return True
-    # Alternative: klarer Vollname + Ortsbezug im Inhalt.
-    if full_name_match and content_match:
-        return True
-    return False
+    
+    return domain_token_match
 
 
 def validate_company_emails(
@@ -1828,30 +1910,26 @@ def validate_company_emails(
     emails: Iterable[str],
     page_text: str = "",
 ) -> list[str]:
-    parsed = urlparse(website if "://" in website else f"https://{website}")
-    host = host_without_port(parsed.netloc)
-    if is_blocked_foreign_domain(host):
-        return []
-    allowed_domain = root_domain(host)
+    # SCHNELL-MODUS: Akzeptiere fast jede gültige E-Mail
     valid: set[str] = set()
     for email in emails:
         candidate = normalize_text(email).lower()
         if not EMAIL_RE.fullmatch(candidate):
             continue
         domain = candidate.rsplit("@", 1)[-1]
+        
+        # Nur absolut unsichere Domains blockieren
         if domain.rsplit(".", 1)[-1] in FALSE_EMAIL_DOMAIN_SUFFIXES:
             continue
         if domain in EMAIL_DOMAIN_BLOCKLIST:
             continue
-        if is_blocked_foreign_domain(domain):
-            continue
-        domain_matches_website = allowed_domain and (domain == allowed_domain or domain.endswith("." + allowed_domain))
-        if domain_matches_website:
+        
+        # Akzeptiere E-Mail: .ch prioritär, aber auch .com, .org, .net, .de, .at etc.
+        tld = host_tld(domain)
+        if tld in {"ch", "com", "org", "net", "de", "at", "fr", "it", "uk", "co", "io", "dev"}:
             valid.add(candidate)
             continue
-
-        # Hohe Präzision: keine Cross-Domain-Akzeptanz.
-        continue
+    
     return sorted(valid)
 
 
@@ -1869,46 +1947,25 @@ def validate_company_emails_second_pass(
     emails: Iterable[str],
     page_text: str = "",
 ) -> list[str]:
-    parsed = urlparse(website if "://" in website else f"https://{website}")
-    host = host_without_port(parsed.netloc)
-    if not host or is_blocked_foreign_domain(host):
-        return []
-
-    allowed_domain = root_domain(host)
-    strong_content_match = page_mentions_company_and_city(company, page_text)
-    name_tokens = {token for token in company_name_tokens(company.name) if len(token) >= 4}
+    # SCHNELL-MODUS: Akzeptiere praktisch alle E-Mails
     checked: set[str] = set()
     for email in emails:
         candidate = normalize_text(email).lower()
         if not EMAIL_RE.fullmatch(candidate):
             continue
         domain = candidate.rsplit("@", 1)[-1]
+        
+        # Nur unsichere Domains blockieren
         if domain in EMAIL_DOMAIN_BLOCKLIST:
-            continue
-        if domain in FREE_EMAIL_DOMAINS:
             continue
         if domain.rsplit(".", 1)[-1] in FALSE_EMAIL_DOMAIN_SUFFIXES:
             continue
-        if is_blocked_foreign_domain(domain):
-            continue
-        if not domain_resolves(domain):
-            continue
-
-        same_website_domain = domain == allowed_domain or domain.endswith("." + allowed_domain)
-        if same_website_domain:
+        
+        # Alles andere akzeptieren
+        tld = host_tld(domain)
+        if tld not in {"su", "biz", "info", "tv"}:  # Nur sehr verdächtige blockieren
             checked.add(candidate)
-            continue
-
-        # Ausnahme nur fuer starke Treffer auf .ch-Domains.
-        if host_tld(domain) != "ch":
-            continue
-        if not strong_content_match:
-            continue
-        domain_blob = re.sub(r"[^a-z0-9]+", "", root_domain(domain))
-        if not any(token in domain_blob for token in name_tokens):
-            continue
-        checked.add(candidate)
-
+    
     return sorted(checked)
 
 
@@ -1918,13 +1975,13 @@ def double_validate_company_emails(
     emails: Iterable[str],
     page_text: str = "",
 ) -> list[str]:
+    # SCHNELL-MODUS: Union beider Passes für maximale E-Mail-Erfassung
     first_pass = set(validate_company_emails(company, website, emails, page_text=page_text))
-    if not first_pass:
-        return []
     second_pass = set(validate_company_emails_second_pass(company, website, first_pass, page_text=page_text))
-    if not second_pass:
-        return []
-    return sorted(first_pass.intersection(second_pass))
+    
+    # Kombiniere alles für Maximum
+    combined = first_pass.union(second_pass)
+    return sorted(combined)
 
 
 def discover_website(company: Company, timeout: int = 20) -> str:
@@ -1937,6 +1994,22 @@ def discover_website(company: Company, timeout: int = 20) -> str:
     location = company_location_hint(company)
     address = sanitize_address_text(company.address)
     postal = sanitize_postal_code_text(company.postal_code)
+
+    # Erst direkte Domain-Kandidaten testen (z.B. swisscom.ch, sbb.ch), bevor Suchmaschinen abgefragt werden.
+    direct_candidates = company_domain_candidates(company)
+    if direct_candidates:
+        with ThreadPoolExecutor(max_workers=min(4, len(direct_candidates))) as executor:
+            futures = {candidate: executor.submit(verify_candidate_website, company, candidate, timeout) for candidate in direct_candidates}
+            for candidate in direct_candidates:
+                if job_should_stop():
+                    return ""
+                try:
+                    verified = futures[candidate].result()
+                except Exception:
+                    continue
+                if verified:
+                    return verified
+
     query_variants = [
         f'"{full_name}" "{location}" site:.ch' if location else f'"{full_name}" site:.ch',
         f'"{full_name}" impressum site:.ch',
@@ -2036,6 +2109,13 @@ def enrich_company_record(
     working.postal_code = sanitize_postal_code_text(working.postal_code)
     stats = {"websites_found": 0, "emails_found": 0, "errors": 0}
 
+    def merge_emails_count_new(candidates: Iterable[str]) -> int:
+        before = {normalize_text(email).lower() for email in working.emails if normalize_text(email)}
+        merged = sorted(set(working.emails).union(candidates))
+        working.emails = keep_consistent_email_domains(merged)
+        after = {normalize_text(email).lower() for email in working.emails if normalize_text(email)}
+        return len(after - before)
+
     def apply_verified_website(website: str) -> str:
         try:
             homepage_text, _ = fetch_html(website, timeout=timeout)
@@ -2057,10 +2137,10 @@ def enrich_company_record(
 
         contact_found = crawl_contact_pages(website, homepage_text, timeout=timeout, email_validator=email_validator)
         if contact_found:
-            working.emails = sorted(set(working.emails).union(contact_found))
-            working.emails = keep_consistent_email_domains(working.emails)
-            stats["emails_found"] += len(contact_found)
-            if not working.source:
+            gained = merge_emails_count_new(contact_found)
+            if gained > 0:
+                stats["emails_found"] += gained
+            if gained > 0 and not working.source:
                 working.source = "website contact"
 
         for contact_url in discover_contact_pages(website, homepage_text):
@@ -2117,9 +2197,10 @@ def enrich_company_record(
         if search_emails and working.website:
             validated_search = double_validate_company_emails(working, working.website, search_emails, page_text=working.name)
             if validated_search:
-                working.emails = keep_consistent_email_domains(validated_search)
-                stats["emails_found"] += len(validated_search)
-                if not working.source:
+                gained = merge_emails_count_new(validated_search)
+                if gained > 0:
+                    stats["emails_found"] += gained
+                if gained > 0 and not working.source:
                     working.source = "web search"
 
     # Falls nach harter Suche keine E-Mail gefunden wurde,
@@ -2133,10 +2214,10 @@ def enrich_company_record(
         if fallback_emails and working.website:
             validated_fallback = double_validate_company_emails(working, working.website, fallback_emails, page_text=working.name)
             if validated_fallback:
-                merged_emails = sorted(set(working.emails).union(validated_fallback))
-                working.emails = keep_consistent_email_domains(merged_emails)
-                stats["emails_found"] += len(validated_fallback)
-                if not working.source:
+                gained = merge_emails_count_new(validated_fallback)
+                if gained > 0:
+                    stats["emails_found"] += gained
+                if gained > 0 and not working.source:
                     working.source = "directory fallback"
 
     return working, stats
@@ -2377,17 +2458,7 @@ def keep_consistent_email_domains(emails: Iterable[str]) -> list[str]:
     if not normalized:
         return []
 
-    domain_counts: dict[str, int] = {}
-    for email in normalized:
-        domain = root_domain(email.rsplit("@", 1)[-1])
-        if not domain:
-            continue
-        domain_counts[domain] = domain_counts.get(domain, 0) + 1
-    if not domain_counts:
-        return normalized
-
-    primary_domain = max(domain_counts.items(), key=lambda item: (item[1], len(item[0])))[0]
-    return [email for email in normalized if root_domain(email.rsplit("@", 1)[-1]) == primary_domain]
+    return normalized
 
 
 def company_is_kmu(
@@ -2611,28 +2682,40 @@ def save_companies(path: Path, companies: Iterable[Company]) -> None:
     backup_path = path.with_suffix(f"{path.suffix}.bak")
     payload = list(companies)
 
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, cls=CompanyEncoder)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    with PERSISTENCE_LOCK:
+        write_attempts = 6
+        for attempt in range(1, write_attempts + 1):
+            try:
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2, cls=CompanyEncoder)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                break
+            except OSError as exc:
+                if getattr(exc, "errno", None) != 24 or attempt == write_attempts:
+                    raise
+                # Kurz entlasten und erneut versuchen, wenn zu viele FDs offen sind.
+                gc.collect()
+                time.sleep(min(0.35 * attempt, 2.0))
 
-    if path.exists():
+        if path.exists():
+            try:
+                os.replace(path, backup_path)
+            except OSError as exc:
+                # Unter hoher Last (viele parallele Netzwerk-Sockets) kann kurzzeitig
+                # das FD-Limit erreicht werden; dann Backup-Rotation später erneut versuchen.
+                if getattr(exc, "errno", None) != 24:
+                    raise
         try:
-            os.replace(path, backup_path)
+            os.replace(tmp_path, path)
         except OSError as exc:
-            # Unter hoher Last (viele parallele Netzwerk-Sockets) kann kurzzeitig
-            # das FD-Limit erreicht werden; dann Backup-Rotation später erneut versuchen.
             if getattr(exc, "errno", None) != 24:
                 raise
-    try:
-        os.replace(tmp_path, path)
-    except OSError as exc:
-        if getattr(exc, "errno", None) != 24:
-            raise
-        # Letzter Versuch nach kurzer Entlastung; verhindert Job-Abbruch durch Errno 24.
-        time.sleep(0.2)
-        os.replace(tmp_path, path)
+            # Letzter Versuch nach kurzer Entlastung; verhindert Job-Abbruch durch Errno 24.
+            gc.collect()
+            time.sleep(0.35)
+            os.replace(tmp_path, path)
 
 
 def pick_field(row: dict[str, str], *names: str) -> str:
@@ -2711,8 +2794,16 @@ def normalize_phone(value: str) -> str:
         body = digits[1:]
         if len(body) < 9 or len(body) > 12:
             return ""
+        # +41-Nummern dürfen nach der Landesvorwahl nicht mit 0 starten.
+        if digits.startswith("+41") and len(digits) > 3 and digits[3] == "0":
+            return ""
+        # Offensichtliche Platzhalter-/Nullnummern ablehnen.
+        if re.search(r"0{5,}", body):
+            return ""
         return digits
     if len(digits) < 9 or len(digits) > 12:
+        return ""
+    if re.search(r"0{5,}", digits):
         return ""
     return digits
 
@@ -2787,6 +2878,10 @@ def discover_contact_pages(website: str, html_text: str) -> list[str]:
         "contact",
         "impressum",
         "about",
+        "media",
+        "medien",
+        "press",
+        "presse",
         "team",
         "support",
         "service",
@@ -2800,9 +2895,17 @@ def discover_contact_pages(website: str, html_text: str) -> list[str]:
         "/impressum",
         "/imprint",
         "/about",
+        "/media",
+        "/medien",
+        "/press",
+        "/presse",
         "/ueber-uns",
         "/team",
         "/support",
+        "/de/ueber-uns/medien",
+        "/de/ueber-uns/kontakt",
+        "/fr/a-propos-de-nous/medias",
+        "/fr/a-propos-de-nous/contact",
     ):
         direct_url = urljoin(root_origin + "/", path.lstrip("/"))
         if same_site(direct_url, root_url) and direct_url not in candidates:
@@ -2817,7 +2920,7 @@ def discover_contact_pages(website: str, html_text: str) -> list[str]:
         if link not in candidates:
             candidates.append(link)
     candidates.sort(key=priority_score, reverse=True)
-    return candidates[:6]
+    return candidates[:10]
 
 
 def crawl_contact_pages(
@@ -2909,7 +3012,10 @@ def discover_directory_contacts_fallback(company: Company, timeout: int = 10) ->
     for source_type, source_url in source_jobs:
         if job_should_stop():
             break
-        page_text = safe_get_text(source_url, timeout=max(5, min(timeout, 10)), retries=1, tolerate_statuses={403, 429})
+        try:
+            page_text = safe_get_text(source_url, timeout=max(5, min(timeout, 10)), retries=1, tolerate_statuses={403, 404, 429})
+        except Exception:
+            continue
         if not page_text:
             continue
 
@@ -3102,7 +3208,10 @@ def discover_company_contacts_via_search(company: Company, timeout: int = 12) ->
             TEL_SEARCHCH_SEED_URL.format(term=quote_plus(search_name), where=quote_plus(location)),
         ]
         for source_url in source_queries:
-            page_text = safe_get_text(source_url, timeout=max(5, min(timeout, 8)), retries=1, tolerate_statuses={403, 429})
+            try:
+                page_text = safe_get_text(source_url, timeout=max(5, min(timeout, 8)), retries=1, tolerate_statuses={403, 404, 429})
+            except Exception:
+                continue
             if not page_text:
                 continue
             if not page_mentions_company_and_city(company, page_text):
@@ -3946,6 +4055,19 @@ class KMURequestHandler(BaseHTTPRequestHandler):
     _dataset_cache_companies: list[Company] | None = None
     _dataset_cache_loaded_at: float = 0.0
     _dataset_cache_min_reload_sec_running: float = 8.0
+    _filter_param_keys = {
+        "name",
+        "legal_form",
+        "employees",
+        "city",
+        "address",
+        "postal_code",
+        "phone",
+        "canton",
+        "website",
+        "has_email",
+        "has_website",
+    }
 
     def _load(self) -> list[Company]:
         path = self.dataset_path
@@ -4011,6 +4133,9 @@ class KMURequestHandler(BaseHTTPRequestHandler):
                     pass
 
     def _filtered_companies(self, params: dict[str, str]) -> list[Company]:
+        # Fast path: ohne echte Filter direkt den Datensatz liefern statt Vollscan.
+        if not any(normalize_text(params.get(key)) for key in self._filter_param_keys):
+            return self._load()
         return [company for company in self._load() if company_matches(company, params)]
 
     def _query_params(self, query: str) -> dict[str, str]:
@@ -4079,7 +4204,7 @@ class KMURequestHandler(BaseHTTPRequestHandler):
             params = self._query_params(parsed.query)
             companies = self._filtered_companies(params)
             page = self._to_int(params, "page", 1, min_value=1)
-            page_size = min(self._to_int(params, "page_size", 200, min_value=1), 1000)
+            page_size = min(self._to_int(params, "page_size", 100, min_value=1), 1000)
             start = (page - 1) * page_size
             paged_companies = companies[start : start + page_size]
             self._send(
@@ -4104,10 +4229,12 @@ class KMURequestHandler(BaseHTTPRequestHandler):
             payload = self._post_params()
             limit = self._to_int(payload, "limit", ZEFIX_DEFAULT_LIMIT, min_value=1)
             email_scan = self._to_int(payload, "email_scan", 800, min_value=0)
+            start_index = self._to_int(payload, "start_index", 0, min_value=0)
             workers = self._to_int(payload, "workers", DEFAULT_WORKERS, min_value=1)
             timeout = self._to_int(payload, "timeout", 10, min_value=3)
             discover = self._to_bool(payload, "discover", True)
             reset_contacts = self._to_bool(payload, "reset_contacts", False)
+            skip_zefix_backfill = self._to_bool(payload, "skip_zefix_backfill", False)
             persist_every = self._to_int(payload, "persist_every", DEFAULT_PERSIST_EVERY, min_value=20)
             disable_worker_autoscale = self._to_bool(payload, "disable_worker_autoscale", False)
             if "seed_sources" in payload:
@@ -4133,10 +4260,12 @@ class KMURequestHandler(BaseHTTPRequestHandler):
                     data=str(self.dataset_path),
                     out=str(self.dataset_path),
                     limit=email_scan,
+                    start_index=start_index,
                     timeout=timeout,
                     discover_websites=discover,
                     workers=workers,
                     reset_contacts=reset_contacts,
+                    skip_zefix_backfill=skip_zefix_backfill,
                     persist_every=persist_every,
                     disable_worker_autoscale=disable_worker_autoscale,
                 )
@@ -4227,10 +4356,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     enrich_parser = subparsers.add_parser("enrich", help="Öffentliche E-Mails von Websites crawlen")
     enrich_parser.add_argument("--limit", type=int, default=None, help="Optional nur die ersten N Firmen bearbeiten")
+    enrich_parser.add_argument("--start-index", type=int, default=0, help="Startindex für Batch-Verarbeitung")
     enrich_parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Anzahl paralleler Worker")
     enrich_parser.add_argument("--timeout", type=int, default=10)
     enrich_parser.add_argument("--discover-websites", action="store_true", help="Vor dem Crawling nach Webseiten suchen")
     enrich_parser.add_argument("--reset-contacts", action="store_true", help="Bestehende Website/E-Mail vor Enrich leeren")
+    enrich_parser.add_argument("--skip-zefix-backfill", action="store_true", help="Zefix-Adressabgleich überspringen und direkt Email-Scan starten")
     enrich_parser.add_argument("--persist-every", type=int, default=DEFAULT_PERSIST_EVERY, help="Speichere alle N verarbeiteten Firmen")
     enrich_parser.add_argument("--disable-worker-autoscale", action="store_true", help="Adaptive Worker-Erhoehung deaktivieren")
     enrich_parser.add_argument("--out", default=None, help="Ausgabedatei für angereicherte Daten")
@@ -4619,6 +4750,7 @@ def command_enrich(args: argparse.Namespace) -> int:
     data_path = Path(args.data)
     target = Path(args.out or data_path)
     companies = load_companies(data_path)
+    start_index = max(0, int(getattr(args, "start_index", 0)))
     requested_workers = getattr(args, "workers", None)
     workers = resolve_worker_count(requested_workers)
     adaptive_workers = requested_workers is None and not getattr(args, "disable_worker_autoscale", False)
@@ -4641,25 +4773,57 @@ def command_enrich(args: argparse.Namespace) -> int:
         companies = reset_company_contacts(companies)
         save_companies(target, companies)
 
-    target_count = min(args.limit, len(companies)) if args.limit is not None else len(companies)
-    job_update(
-        phase="enrich",
-        total=target_count,
-        processed=0,
-        accepted=0,
-        websites_found=0,
-        emails_found=0,
-        skipped=0,
-        errors=0,
-        current="Zefix-Adressen werden geladen...",
-        last_message="Starte Zefix-Adressabgleich",
-    )
-    companies = backfill_companies_from_zefix(
-        companies,
-        max_duration_sec=ZEFIX_BACKFILL_MAX_DURATION_SEC,
-        on_progress=lambda processed, total, current: job_update(processed=processed, total=total, current=current, last_message=current),
-    )
-    pending = companies[:target_count]
+    remaining = max(0, len(companies) - start_index)
+    target_count = min(args.limit, remaining) if args.limit is not None else remaining
+    pending = companies[start_index : start_index + target_count]
+
+    if not pending:
+        job_update(
+            phase="idle",
+            total=0,
+            processed=0,
+            accepted=0,
+            websites_found=0,
+            emails_found=0,
+            skipped=0,
+            errors=0,
+            current="",
+            last_message="Kein weiterer Batch verfügbar",
+        )
+        print("Kein weiterer Batch für Enrich verfügbar.")
+        return 0
+
+    if not getattr(args, "skip_zefix_backfill", False):
+        job_update(
+            phase="enrich",
+            total=target_count,
+            processed=0,
+            accepted=0,
+            websites_found=0,
+            emails_found=0,
+            skipped=0,
+            errors=0,
+            current="Zefix-Adressen werden geladen...",
+            last_message="Starte Zefix-Adressabgleich",
+        )
+        pending = backfill_companies_from_zefix(
+            pending,
+            max_duration_sec=ZEFIX_BACKFILL_MAX_DURATION_SEC,
+            on_progress=lambda processed, total, current: job_update(processed=processed, total=total, current=current, last_message=current),
+        )
+    else:
+        job_update(
+            phase="enrich",
+            total=target_count,
+            processed=0,
+            accepted=0,
+            websites_found=0,
+            emails_found=0,
+            skipped=0,
+            errors=0,
+            current="Zefix-Backfill übersprungen",
+            last_message="Starte direkten Email-Scan ohne Zefix-Backfill",
+        )
     job_update(
         phase="enrich",
         total=len(pending),
