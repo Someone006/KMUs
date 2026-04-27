@@ -1910,7 +1910,7 @@ def validate_company_emails(
     emails: Iterable[str],
     page_text: str = "",
 ) -> list[str]:
-    # SCHNELL-MODUS: Akzeptiere fast jede gültige E-Mail
+    # SCHNELL-MODUS: Akzeptiere fast jede gültige E-Mail, bevorzuge aber .ch
     valid: set[str] = set()
     for email in emails:
         candidate = normalize_text(email).lower()
@@ -1918,15 +1918,22 @@ def validate_company_emails(
             continue
         domain = candidate.rsplit("@", 1)[-1]
         
-        # Nur absolut unsichere Domains blockieren
+        # Blockiere nur absolut unsichere Domains
         if domain.rsplit(".", 1)[-1] in FALSE_EMAIL_DOMAIN_SUFFIXES:
             continue
         if domain in EMAIL_DOMAIN_BLOCKLIST:
             continue
         
+        # Blocke Standard Free-Email Domains (aber nicht unbedingt alle)
+        if domain in FREE_EMAIL_DOMAINS and domain not in {"test.ch", "example.ch"}:
+            # Für .ch Free-Emails akzeptieren, aber für .com etc. blockieren
+            tld = host_tld(domain)
+            if tld != "ch":
+                continue
+        
         # Akzeptiere E-Mail: .ch prioritär, aber auch .com, .org, .net, .de, .at etc.
         tld = host_tld(domain)
-        if tld in {"ch", "com", "org", "net", "de", "at", "fr", "it", "uk", "co", "io", "dev"}:
+        if tld in {"ch", "com", "org", "net", "de", "at", "fr", "it", "uk", "co", "io", "dev", "app"}:
             valid.add(candidate)
             continue
     
