@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Night-native palette, authored in OKLCH.
+ * Surfaces carry a slight cast toward the accent - a perfectly neutral grey
+ * reads as dead on a dark ground, a saturated one reads as cheap.
+ * Elevation is expressed by lighter surfaces plus a hairline, never by
+ * heavier shadows, which barely register on dark.
+ */
+:root {
+  --ground:   oklch(0.155 0.018 292);
+  --surface:  oklch(0.196 0.021 292);
+  --raised:   oklch(0.238 0.024 292);
+  --overlay:  oklch(0.280 0.026 292);
+  --hairline: oklch(0.92 0.02 292 / 0.11);
+
+  /* ~92% white rather than pure white: pure white on near-black haloes. */
+  --ink:   oklch(0.958 0.004 292);
+  --muted: oklch(0.760 0.014 292);
+  --faint: oklch(0.585 0.016 292);
+
+  --accent:      oklch(0.735 0.178 291);
+  --accent-soft: oklch(0.735 0.178 291 / 0.14);
+  --warn: oklch(0.812 0.154 78);
+  --good: oklch(0.780 0.152 158);
+  --bad:  oklch(0.688 0.194 22);
+
+  color-scheme: dark;
+}
+
+* { -webkit-tap-highlight-color: transparent; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* Any number that updates in place must not make the layout shiver. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Visible focus on every interactive element - never removed, only restyled. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+::selection { background: var(--accent-soft); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: oklch(0.4 0.02 292 / 0.5);
+  border-radius: 999px;
+  border: 3px solid var(--ground);
+}
+
+@layer components {
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+  }
+  .card-raised {
+    background: var(--raised);
+    border: 1px solid var(--hairline);
+    border-radius: 16px;
+  }
+  .label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@layer components {
+  .input {
+    width: 100%;
+    min-height: 48px;
+    padding: 0 14px;
+    border-radius: 12px;
+    background: var(--raised);
+    border: 1px solid var(--hairline);
+    color: var(--ink);
+    font-size: 15px;
+    transition: border-color 120ms ease-out;
+  }
+  .input::placeholder { color: var(--faint); }
+  .input:focus { border-color: var(--accent); }
+  select.input { appearance: none; padding-right: 34px; }
+}
